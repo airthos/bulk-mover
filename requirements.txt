@@ -1,0 +1,5 @@
+msal
+requests
+inquirer
+tqdm
+python-dotenv
