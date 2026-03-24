@@ -2,6 +2,8 @@ import time
 from typing import Generator, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -10,6 +12,37 @@ SOURCE_SELECT = (
     "id,name,size,file,folder,fileSystemInfo,createdBy,lastModifiedBy,"
     "createdDateTime,lastModifiedDateTime,sharepointIds,parentReference"
 )
+
+
+# ---------------------------------------------------------------------------
+# Shared session with transport-level retry + connection pooling
+# ---------------------------------------------------------------------------
+
+_retry = Retry(
+    total=5,
+    backoff_factor=1.0,
+    status_forcelist=[500, 502, 503, 504],
+    backoff_jitter=0.3,
+    allowed_methods=["GET", "POST", "PUT", "PATCH"],
+)
+_adapter = HTTPAdapter(
+    max_retries=_retry,
+    pool_connections=1,   # single host: graph.microsoft.com
+    pool_maxsize=4,
+)
+
+_session = requests.Session()
+_session.mount("https://", _adapter)
+_session.headers.update({
+    "User-Agent": "NONISV|Airtho|BulkMover/1.0",
+})
+
+# Separate session for anonymous poll URLs (no auth, still needs retry)
+_poll_session = requests.Session()
+_poll_session.mount("https://", _adapter)
+_poll_session.headers.update({
+    "User-Agent": "NONISV|Airtho|BulkMover/1.0",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -24,11 +57,11 @@ def _headers(token: str) -> dict:
 
 
 def _request(method: str, url: str, token: str, retries: int = 5, **kwargs) -> requests.Response:
-    """Single Graph API request with throttle/retry handling."""
+    """Single Graph API request with app-level throttle/retry on top of transport retry."""
     headers = _headers(token)
     headers.update(kwargs.pop("extra_headers", {}))
     for attempt in range(retries):
-        resp = requests.request(method, url, headers=headers, **kwargs)
+        resp = _session.request(method, url, headers=headers, timeout=30, **kwargs)
         if resp.status_code in (429, 503):
             wait = int(resp.headers.get("Retry-After", 2 ** attempt * 5))
             time.sleep(wait)
@@ -131,15 +164,23 @@ def copy_item(
     dest_drive_id: str,
     dest_folder_id: str,
     token: str,
+    conflict_behavior: Optional[str] = None,
 ) -> str:
-    """Trigger a server-side copy. Returns the Location URL to poll."""
+    """Trigger a server-side copy. Returns the Location URL to poll.
+
+    conflict_behavior: "replace" to overwrite existing, "rename" to add suffix,
+    or None for default (fail on conflict).
+    Only pass "replace" when the caller has already confirmed source is newer.
+    """
     url = f"{GRAPH_BASE}/drives/{source_drive_id}/items/{item_id}/copy"
-    body = {
+    body: dict = {
         "parentReference": {
             "driveId": dest_drive_id,
             "id": dest_folder_id,
         }
     }
+    if conflict_behavior:
+        body["@microsoft.graph.conflictBehavior"] = conflict_behavior
     resp = _request("POST", url, token, json=body)
     location = resp.headers.get("Location")
     if not location:
@@ -149,24 +190,47 @@ def copy_item(
 
 def poll_copy_job(
     location: str,
-    timeout_seconds: int = 600,
-    poll_interval: int = 3,
+    timeout_seconds: Optional[int] = None,
+    progress_callback=None,
 ) -> dict:
     """
     Poll a copy job monitor URL until completed, failed, or timed out.
     The Location URL is anonymous — no auth header required.
-    Returns the final status response body.
+
+    Uses exponential backoff: starts at 5s, grows by 1.5x, caps at 60s.
+    timeout_seconds=None means poll indefinitely.
+
+    Returns the final status response body. On timeout, includes the
+    Location URL so callers can persist it for later resume.
     """
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        resp = requests.get(location)
+    interval = 5.0
+    start = time.time()
+
+    while True:
+        if timeout_seconds is not None and (time.time() - start) >= timeout_seconds:
+            return {"status": "timeout", "_location": location}
+
+        try:
+            resp = _poll_session.get(location, timeout=30)
+        except requests.RequestException:
+            # Transport error — back off and retry
+            time.sleep(min(interval, 60))
+            interval = min(interval * 1.5, 60)
+            continue
+
         if resp.status_code in (200, 202):
             data = resp.json()
             status = data.get("status", "")
+
+            pct = data.get("percentageComplete") or data.get("percentComplete", 0)
+            if progress_callback and pct:
+                progress_callback(pct, time.time() - start)
+
             if status in ("completed", "failed"):
                 return data
-        time.sleep(poll_interval)
-    return {"status": "timeout"}
+
+        time.sleep(interval)
+        interval = min(interval * 1.5, 60)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +280,76 @@ def batch_get_items(requests_list: list[dict], token: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 # SharePoint metadata
 # ---------------------------------------------------------------------------
+
+def search_drive_folders(drive_id: str, query: str, token: str) -> list[dict]:
+    """
+    Search a drive for folders matching query. Returns normalised folder dicts.
+    Includes mount-point shortcuts (remoteItem) which are invisible to /children.
+
+    Only fetches the first page — search results can span thousands of pages and
+    mount-point shortcuts appear in results when the query matches their name.
+    """
+    url = f"{GRAPH_BASE}/drives/{drive_id}/root/search(q='{query}')"
+    resp = _request("GET", url, token, params={"$top": 50})
+    items = resp.json().get("value", [])
+    folders = []
+    for item in items:
+        if "remoteItem" in item:
+            remote = item["remoteItem"]
+            if "file" in remote or "file" in item:
+                continue
+            folders.append({
+                "id": remote["id"],
+                "name": item["name"],
+                "folder": remote.get("folder") or item.get("folder", {}),
+                "_drive_id": remote.get("parentReference", {}).get("driveId"),
+                "_shared": True,
+            })
+        elif "folder" in item:
+            folders.append(item)
+    return folders
+
+
+
+# ---------------------------------------------------------------------------
+# Delta queries
+# ---------------------------------------------------------------------------
+
+def get_drive_delta(
+    drive_id: str,
+    token: str,
+    delta_link: str | None = None,
+    select: str | None = None,
+) -> tuple[list[dict], str]:
+    """
+    Fetch changed/new items since the last delta token.
+
+    If delta_link is None, does a full enumeration (initial sync).
+    Returns (items, new_delta_link).
+    """
+    if delta_link:
+        url = delta_link
+        params = None
+    else:
+        url = f"{GRAPH_BASE}/drives/{drive_id}/root/delta"
+        params = {}
+        if select:
+            params["$select"] = select
+
+    items: list[dict] = []
+    new_delta_link = ""
+
+    while url:
+        resp = _request("GET", url, token, params=params)
+        data = resp.json()
+        items.extend(data.get("value", []))
+        url = data.get("@odata.nextLink")
+        params = None  # nextLink has params baked in
+        if "@odata.deltaLink" in data:
+            new_delta_link = data["@odata.deltaLink"]
+
+    return items, new_delta_link
+
 
 def patch_list_item_fields(
     site_id: str,

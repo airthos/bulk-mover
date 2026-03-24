@@ -131,13 +131,25 @@ def init_manifest(
     source_folder: str,
     dest_site: str,
     dest_library: str,
+    *,
+    source_drive_id: str = "",
+    source_folder_id: str = "",
+    dest_drive_id: str = "",
+    dest_root_id: str = "",
+    batch_names: list[str] | None = None,
 ) -> dict:
     return {
         "session_id": session_id,
+        "status": "in_progress",
         "source_upn": source_upn,
         "source_folder": source_folder,
+        "source_drive_id": source_drive_id,
+        "source_folder_id": source_folder_id,
         "dest_site": dest_site,
         "dest_library": dest_library,
+        "dest_drive_id": dest_drive_id,
+        "dest_root_id": dest_root_id,
+        "batch_names": batch_names or [],
         "batches": [],
     }
 
@@ -171,6 +183,10 @@ def add_batch_to_manifest(
     manifest["batches"].append(batch_entry)
 
 
+def mark_manifest_completed(manifest: dict) -> None:
+    manifest["status"] = "completed"
+
+
 def save_manifest(manifest: dict, source_folder: str, session_id: str) -> Path:
     _ensure_logs_dir()
     date = session_id[:10]
@@ -178,4 +194,19 @@ def save_manifest(manifest: dict, source_folder: str, session_id: str) -> Path:
     with open(filename, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2, default=str)
     return filename
+
+
+def find_incomplete_sessions() -> list[tuple[Path, dict]]:
+    """Find manifest files with status 'in_progress'. Returns [(path, manifest), ...]."""
+    _ensure_logs_dir()
+    results = []
+    for p in sorted(LOGS_DIR.glob("*_session.manifest.json"), reverse=True):
+        try:
+            with open(p, encoding="utf-8") as fh:
+                manifest = json.load(fh)
+            if manifest.get("status") == "in_progress":
+                results.append((p, manifest))
+        except (json.JSONDecodeError, OSError):
+            continue
+    return results
 

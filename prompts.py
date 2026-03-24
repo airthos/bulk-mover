@@ -1,6 +1,38 @@
+from pathlib import Path
 from typing import Optional
 
 import inquirer
+
+
+# ---------------------------------------------------------------------------
+# Session resume
+# ---------------------------------------------------------------------------
+
+def prompt_resume_session(sessions: list[tuple[Path, dict]]) -> dict | None:
+    """
+    Ask the user if they want to resume an incomplete session.
+    Returns the manifest dict to resume, or None to start fresh.
+    """
+    choices = ["[Start new session]"]
+    for path, manifest in sessions:
+        completed = len(manifest.get("batches", []))
+        total = len(manifest.get("batch_names", []))
+        label = (
+            f"{manifest['source_folder']} → {manifest['dest_library']} "
+            f"({completed}/{total} batches) — {manifest['session_id']}"
+        )
+        choices.append(label)
+
+    answers = inquirer.prompt([
+        inquirer.List("session", message="Resume an incomplete session?", choices=choices)
+    ])
+    selected = answers["session"]
+
+    if selected == "[Start new session]":
+        return None
+
+    idx = choices.index(selected) - 1  # offset for [Start new session]
+    return sessions[idx][1]
 
 
 # ---------------------------------------------------------------------------
@@ -16,14 +48,31 @@ def prompt_source_upn() -> str:
 
 def prompt_source_folder(folders: list[dict]) -> dict:
     """
-    Let the user pick from top-level OneDrive folders or enter a custom path.
-    Returns the selected driveItem dict, or a synthetic dict with '_custom_path'.
+    Let the user pick from top-level OneDrive folders, shared folders, or enter a custom path.
+    Returns the selected driveItem dict, or a synthetic dict with '_custom_path' / '_use_root'.
     """
-    choices = [f["name"] for f in folders] + ["[Enter custom path]"]
+    def display(f: dict) -> str:
+        return f"{f['name']}  (shared)" if f.get("_shared") else f["name"]
+
+    choices = (
+        ["[Use drive root]"]
+        + [display(f) for f in folders]
+        + ["[Search for folder by name]", "[Enter custom path]"]
+    )
     answers = inquirer.prompt([
         inquirer.List("folder", message="Select source folder", choices=choices)
     ])
     selected = answers["folder"]
+
+    if selected == "[Use drive root]":
+        return {"name": "root", "_use_root": True}
+
+    if selected == "[Search for folder by name]":
+        query = inquirer.prompt([
+            inquirer.Text("query", message="Enter folder name to search for")
+        ])["query"].strip()
+        return {"name": query, "_search_query": query}
+
 
     if selected == "[Enter custom path]":
         path = inquirer.prompt([
@@ -31,7 +80,22 @@ def prompt_source_folder(folders: list[dict]) -> dict:
         ])["path"].strip().lstrip("/")
         return {"name": path.split("/")[-1], "_custom_path": path}
 
-    return next(f for f in folders if f["name"] == selected)
+    return next(f for f in folders if display(f) == selected)
+
+
+def prompt_search_result(folders: list[dict]) -> dict:
+    """Pick from folders returned by a name search."""
+    def display(f: dict) -> str:
+        label = f["name"]
+        if f.get("_shared"):
+            label += "  (shared)"
+        return label
+
+    choices = [display(f) for f in folders]
+    answers = inquirer.prompt([
+        inquirer.List("folder", message="Select folder from search results", choices=choices)
+    ])
+    return next(f for f in folders if display(f) == answers["folder"])
 
 
 # ---------------------------------------------------------------------------

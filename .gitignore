@@ -1,0 +1,23 @@
+# Environment
+.env
+
+# MSAL token cache — contains sensitive auth tokens
+token_cache.json
+
+# Migration output
+migration-logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# macOS
+.DS_Store
