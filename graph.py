@@ -1,5 +1,5 @@
 import time
-from typing import Generator, Optional
+from typing import Callable, Generator, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -44,6 +44,19 @@ _poll_session.headers.update({
     "User-Agent": "NONISV|Airtho|BulkMover/1.0",
 })
 
+# Optional token refresher — set once at startup via register_token_refresher()
+_token_refresher: Optional[Callable[[], str]] = None
+
+
+def register_token_refresher(fn: Callable[[], str]) -> None:
+    """Register a callable that returns a fresh access token on demand.
+
+    Called once from migrate.py after initial auth so that _request can
+    transparently recover from 401 (token expiry) mid-session.
+    """
+    global _token_refresher
+    _token_refresher = fn
+
 
 # ---------------------------------------------------------------------------
 # Core request helpers
@@ -57,11 +70,19 @@ def _headers(token: str) -> dict:
 
 
 def _request(method: str, url: str, token: str, retries: int = 5, **kwargs) -> requests.Response:
-    """Single Graph API request with app-level throttle/retry on top of transport retry."""
-    headers = _headers(token)
-    headers.update(kwargs.pop("extra_headers", {}))
+    """Single Graph API request with app-level throttle/retry on top of transport retry.
+
+    On a 401 (token expiry), calls the registered token refresher once and
+    retries immediately before falling through to raise_for_status.
+    """
+    extra = kwargs.pop("extra_headers", {})
+    _tok = token
     for attempt in range(retries):
-        resp = _session.request(method, url, headers=headers, timeout=30, **kwargs)
+        hdrs = {**_headers(_tok), **extra}
+        resp = _session.request(method, url, headers=hdrs, timeout=30, **kwargs)
+        if resp.status_code == 401 and _token_refresher is not None and attempt == 0:
+            _tok = _token_refresher()
+            continue
         if resp.status_code in (429, 503):
             wait = int(resp.headers.get("Retry-After", 2 ** attempt * 5))
             time.sleep(wait)

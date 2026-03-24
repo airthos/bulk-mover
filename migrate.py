@@ -52,6 +52,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     print("[1] Sign in")
     token = auth.get_access_token()
+    graph.register_token_refresher(auth.get_access_token)
 
     # ------------------------------------------------------------------
     # Check for incomplete sessions
@@ -493,6 +494,7 @@ def _run_verify_only(manifest_path: str) -> None:
 
     print("[1] Sign in")
     token = auth.get_access_token()
+    graph.register_token_refresher(auth.get_access_token)
 
     dest_drive_id = manifest["dest_drive_id"]
     dest_root_id = manifest["dest_root_id"]
