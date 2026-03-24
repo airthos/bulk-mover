@@ -75,7 +75,7 @@ def main() -> None:
     if action == "resume":
         _run_resumed_session(selected_manifest, token)
     elif action == "verify":
-        _combined_verify_session(selected_manifest, token)
+        _verify_session(selected_manifest, token)
     elif action == "verify_manual":
         _verify_adhoc(token, default_upn=default_upn)
     else:
