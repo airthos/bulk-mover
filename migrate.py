@@ -28,7 +28,7 @@ def main() -> None:
     parser.add_argument(
         "--verify-only",
         metavar="MANIFEST",
-        help="Re-verify all batches from a session manifest JSON (no copying)",
+        help="Re-verify all batches from a session manifest JSON via delta walk (no copying)",
     )
     parser.add_argument(
         "--parallel",
@@ -39,43 +39,58 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Stash parallel setting for use by _run_batches
     _parallel_workers = min(max(args.parallel, 1), 4)
 
-    if args.verify_only:
-        _run_verify_only(args.verify_only)
-        return
     print("\n=== OneDrive → SharePoint Migration Tool ===\n")
 
-    # ------------------------------------------------------------------
-    # [1] Auth
-    # ------------------------------------------------------------------
-    print("[1] Sign in")
+    # Flag-based dispatch (scripting / CI use)
+    if args.verify_only:
+        path = Path(args.verify_only)
+        if not path.exists():
+            print(f"Error: manifest not found: {args.verify_only}")
+            sys.exit(1)
+        with open(path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        token = auth.get_access_token()
+        graph.register_token_refresher(auth.get_access_token)
+        _verify_session(manifest, token)
+        return
+
+    # Read cached UPN before any network calls (reads token_cache.json only)
+    default_upn = auth.get_signed_in_upn() or ""
+
+    # Scan sessions from disk — no network needed
+    incomplete = report.find_incomplete_sessions()
+    all_sessions = report.find_all_sessions()
+
+    # Always show startup menu (Deep Verify manual is always available)
+    action, selected_manifest = prompts.prompt_startup_action(incomplete, all_sessions)
+
+    print("[Auth] Sign in")
     token = auth.get_access_token()
     graph.register_token_refresher(auth.get_access_token)
+    # Refresh default UPN in case auth updated the cache
+    default_upn = auth.get_signed_in_upn() or default_upn
 
-    # ------------------------------------------------------------------
-    # Check for incomplete sessions
-    # ------------------------------------------------------------------
-    incomplete = report.find_incomplete_sessions()
-    resumed_manifest = None
-    if incomplete:
-        resumed_manifest = prompts.prompt_resume_session(incomplete)
-
-    if resumed_manifest:
-        _run_resumed_session(resumed_manifest, token)
+    if action == "resume":
+        _run_resumed_session(selected_manifest, token)
+    elif action == "verify":
+        _combined_verify_session(selected_manifest, token)
+    elif action == "verify_manual":
+        _verify_adhoc(token, default_upn=default_upn)
     else:
-        _run_new_session(token)
+        _run_new_session(token, default_upn=default_upn)
 
 
-def _run_new_session(token: str) -> None:
-    """Full interactive flow: pick source, dest, scan, run."""
-
-    # ------------------------------------------------------------------
-    # [2] Source (OneDrive)
-    # ------------------------------------------------------------------
-    print("[2] Pick source (OneDrive)")
-    upn = prompts.prompt_source_upn()
+def _pick_source(
+    token: str, default_upn: str = "", step_prefix: str = ""
+) -> tuple[str, str, str, str]:
+    """
+    Interactive source selection. Returns (source_drive_id, source_folder_id,
+    source_folder_name, upn).
+    """
+    print(f"{step_prefix}Pick source (OneDrive)")
+    upn = prompts.prompt_source_upn(default=default_upn)
 
     print("  Fetching drive...", end="", flush=True)
     drive = graph.get_user_drive(upn, token)
@@ -128,10 +143,17 @@ def _run_new_session(token: str) -> None:
     if source_folder_item.get("_drive_id"):
         source_drive_id = source_folder_item["_drive_id"]
 
-    # ------------------------------------------------------------------
-    # [3] Destination (SharePoint)
-    # ------------------------------------------------------------------
-    print("\n[3] Pick destination (SharePoint)")
+    return source_drive_id, source_folder_id, source_folder_name, upn
+
+
+def _pick_dest(
+    token: str, step_prefix: str = ""
+) -> tuple[str, str, str, str]:
+    """
+    Interactive destination selection. Returns (dest_drive_id, dest_root_id,
+    site_input, dest_library_name).
+    """
+    print(f"\n{step_prefix}Pick destination (SharePoint)")
     site_input = prompts.prompt_dest_site()
 
     if "/" in site_input:
@@ -164,6 +186,19 @@ def _run_new_session(token: str) -> None:
     dest_folder = prompts.prompt_dest_folder(dest_folders)
     dest_root_id = dest_folder["id"] if dest_folder else "root"
 
+    return dest_drive_id, dest_root_id, site_input, dest_library["name"]
+
+
+def _run_new_session(token: str, default_upn: str = "") -> None:
+    """Full interactive flow: pick source, dest, scan, run."""
+
+    source_drive_id, source_folder_id, source_folder_name, upn = _pick_source(
+        token, default_upn, step_prefix="[2] "
+    )
+    dest_drive_id, dest_root_id, site_input, dest_library_name = _pick_dest(
+        token, step_prefix="[3] "
+    )
+
     # ------------------------------------------------------------------
     # [4] Scan batches
     # ------------------------------------------------------------------
@@ -189,17 +224,21 @@ def _run_new_session(token: str) -> None:
         source_upn=upn,
         source_folder=source_folder_name,
         dest_site=site_input,
-        dest_library=dest_library["name"],
+        dest_library=dest_library_name,
         source_drive_id=source_drive_id,
         source_folder_id=source_folder_id,
         dest_drive_id=dest_drive_id,
         dest_root_id=dest_root_id,
         batch_names=[b["name"] for b in batches],
     )
+    sdir = report.session_dir(session_id, source_folder_name)
+    batch_mod.set_session_dir(sdir)
+    verify.set_session_dir(sdir)
     manifest_path = report.save_manifest(manifest, source_folder_name, session_id)
 
     _run_batches(batches, source_drive_id, dest_drive_id, dest_root_id,
-                 source_folder_name, manifest, session_id, token)
+                 source_folder_name, manifest, session_id, token,
+                 total_batches=len(batches))
 
     report.mark_manifest_completed(manifest)
     report.save_manifest(manifest, source_folder_name, session_id)
@@ -211,23 +250,33 @@ def _run_new_session(token: str) -> None:
 
 def _run_resumed_session(manifest: dict, token: str) -> None:
     """Resume an incomplete session — skip all prompts and completed batches."""
-    session_id = manifest["session_id"]
-    source_folder_name = manifest["source_folder"]
-    source_drive_id = manifest["source_drive_id"]
-    source_folder_id = manifest["source_folder_id"]
-    dest_drive_id = manifest["dest_drive_id"]
-    dest_root_id = manifest["dest_root_id"]
+    session_id = manifest.get("session_id") or "legacy"
+    source_folder_name = manifest.get("source_folder", "unknown")
+    source_drive_id = manifest.get("source_drive_id", "")
+    source_folder_id = manifest.get("source_folder_id", "")
+    dest_drive_id = manifest.get("dest_drive_id", "")
+    dest_root_id = manifest.get("dest_root_id") or "root"
+
+    if not source_folder_id or not source_drive_id or not dest_drive_id:
+        print("  Error: session manifest is missing required IDs — cannot resume copy.")
+        print("  Use verify mode instead.")
+        return
 
     completed_names = {b["batch_name"] for b in manifest.get("batches", [])}
 
     print(f"\nResuming session {session_id}")
-    print(f"  {source_folder_name} → {manifest['dest_library']}")
+    print(f"  {source_folder_name} → {manifest.get('dest_library', '?')}")
     print(f"  {len(completed_names)}/{len(manifest.get('batch_names', []))} batches already done\n")
 
     # Re-scan to get current batch dicts (need item_id etc.)
     print("  Re-scanning batches...", end="", flush=True)
     batches = batch_mod.scan_batches(source_drive_id, source_folder_id, token)
     print(f" {len(batches)} found")
+
+    # Point session dir at the existing session folder
+    sdir = report.session_dir(session_id, source_folder_name)
+    batch_mod.set_session_dir(sdir)
+    verify.set_session_dir(sdir)
 
     # Filter to only incomplete batches
     remaining = [b for b in batches if b["name"] not in completed_names]
@@ -241,7 +290,9 @@ def _run_resumed_session(manifest: dict, token: str) -> None:
     print(f"  {len(remaining)} batch(es) remaining\n")
 
     _run_batches(remaining, source_drive_id, dest_drive_id, dest_root_id,
-                 source_folder_name, manifest, session_id, token)
+                 source_folder_name, manifest, session_id, token,
+                 total_batches=len(manifest["batch_names"]) if manifest.get("batch_names") else len(batches),
+                 is_resuming=True)
 
     report.mark_manifest_completed(manifest)
     manifest_path = report.save_manifest(manifest, source_folder_name, session_id)
@@ -260,17 +311,22 @@ def _run_batches(
     manifest: dict,
     session_id: str,
     token: str,
+    total_batches: int = 0,
+    is_resuming: bool = False,
 ) -> None:
     """Execute the copy->verify->report loop for a list of batches."""
+    total = total_batches or len(batches)
     if _parallel_workers > 1:
         _run_batches_parallel(
             batches, source_drive_id, dest_drive_id, dest_root_id,
             source_folder_name, manifest, session_id, token,
+            total_batches=total, is_resuming=is_resuming,
         )
     else:
         _run_batches_sequential(
             batches, source_drive_id, dest_drive_id, dest_root_id,
             source_folder_name, manifest, session_id, token,
+            total_batches=total, is_resuming=is_resuming,
         )
 
 
@@ -283,13 +339,16 @@ def _run_batches_sequential(
     manifest: dict,
     session_id: str,
     token: str,
+    total_batches: int = 0,
+    is_resuming: bool = False,
 ) -> None:
     """Sequential batch execution (default)."""
+    total = total_batches or len(batches)
     session_start = time.monotonic()
     batch_times: list[float] = []
 
-    for idx, b in enumerate(batches):
-        _print_session_progress(idx, len(batches), batch_times, session_start)
+    for b in batches:
+        _print_session_progress(b["number"], total, batch_times, session_start, is_resuming)
 
         batch_start = time.monotonic()
         files = _execute_single_batch(
@@ -308,13 +367,17 @@ def _run_batches_parallel(
     manifest: dict,
     session_id: str,
     token: str,
+    total_batches: int = 0,
+    is_resuming: bool = False,
 ) -> None:
     """Parallel batch execution using ThreadPoolExecutor."""
+    total = total_batches or len(batches)
     manifest_lock = threading.Lock()
     session_start = time.monotonic()
     completed_count = 0
+    resume_tag = " [resuming]" if is_resuming else ""
 
-    print(f"  Running {len(batches)} batches with {_parallel_workers} workers\n")
+    print(f"  Running {len(batches)} batches with {_parallel_workers} workers{resume_tag}\n")
 
     def _worker(b: dict) -> None:
         nonlocal completed_count
@@ -325,8 +388,8 @@ def _run_batches_parallel(
         )
         completed_count += 1
         elapsed = _fmt_duration(time.monotonic() - session_start)
-        remaining = len(batches) - completed_count
-        print(f"\n--- {completed_count}/{len(batches)} done — {elapsed} elapsed — {remaining} remaining ---")
+        remaining_count = len(batches) - completed_count
+        print(f"\n--- {completed_count}/{total} done — {elapsed} elapsed — {remaining_count} remaining ---")
 
     # Root files batch must run alone (individual file copies, not parallelizable with folders)
     root_batches = [b for b in batches if b["is_root_files"]]
@@ -386,7 +449,7 @@ def _execute_single_batch(
                 f["verify_notes"] = "Dest folder not found after copy"
 
     csv_path = report.write_batch_csv(
-        source_folder_name, b["number"], b["name"], files
+        source_folder_name, b["number"], b["name"], files, session_id
     )
     print(f"  CSV written: {csv_path}")
 
@@ -414,10 +477,11 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _print_session_progress(
-    current_idx: int,
-    total: int,
+    batch_num: int,
+    total_batches: int,
     batch_times: list[float],
     session_start: float,
+    is_resuming: bool = False,
 ) -> None:
     """Print session-level progress: batch N/total, elapsed, estimated remaining."""
     elapsed = time.monotonic() - session_start
@@ -425,12 +489,13 @@ def _print_session_progress(
 
     if batch_times:
         avg_time = sum(batch_times) / len(batch_times)
-        remaining = avg_time * (total - current_idx)
-        remaining_str = f" — ~{_fmt_duration(remaining)} remaining"
+        remaining_batches = total_batches - batch_num
+        remaining_str = f" — ~{_fmt_duration(avg_time * remaining_batches)} remaining"
     else:
         remaining_str = ""
 
-    print(f"\n--- Batch {current_idx + 1}/{total} — {elapsed_str} elapsed{remaining_str} ---")
+    resume_tag = " [resuming]" if is_resuming else ""
+    print(f"\n--- Batch {batch_num}/{total_batches}{resume_tag} — {elapsed_str} elapsed{remaining_str} ---")
 
 
 def _parse_root_items(top_level: list[dict]) -> list[dict]:
@@ -478,78 +543,154 @@ def _find_dest_folder(
     )
 
 
-def _run_verify_only(manifest_path: str) -> None:
-    """Re-verify all batches from an existing session manifest (no copying)."""
-    path = Path(manifest_path)
-    if not path.exists():
-        print(f"Error: manifest not found: {manifest_path}")
-        sys.exit(1)
+def _manifest_to_source_dicts(files: list[dict]) -> list[dict]:
+    """Convert manifest batch file entries to the driveItem-like dicts verify expects."""
+    return [
+        {
+            "id": f.get("source_id"),
+            "_path": f.get("source_path", ""),
+            "name": f.get("source_path", "").rsplit("/", 1)[-1],
+            "size": f.get("size", 0),
+            "file": {"hashes": {"quickXorHash": f.get("quickXorHash", "")}} if f.get("quickXorHash") else {},
+        }
+        for f in files
+    ]
 
-    with open(path, encoding="utf-8") as fh:
-        manifest = json.load(fh)
 
-    print(f"\n=== Verify-Only Mode ===")
-    print(f"Session: {manifest['session_id']}")
-    print(f"Source: {manifest['source_folder']} → {manifest['dest_library']}\n")
+_OK_STATUSES = {"OK", "OK_SP_OVERHEAD", "OK_IMAGE_META"}
 
-    print("[1] Sign in")
-    token = auth.get_access_token()
-    graph.register_token_refresher(auth.get_access_token)
 
-    dest_drive_id = manifest["dest_drive_id"]
-    dest_root_id = manifest["dest_root_id"]
-    source_folder_name = manifest["source_folder"]
-    session_id = manifest["session_id"]
+def _verify_session(manifest: dict, token: str) -> None:
+    """
+    Verify all batches from a session manifest via delta walk (no copying).
+    Enumerates ALL destination files in one delta pass, then matches every source
+    file from the manifest. Works for both --verify-only and the interactive menu.
+    """
+    dest_drive_id = manifest.get("dest_drive_id", "")
+    dest_root_id = manifest.get("dest_root_id") or "root"
+    source_folder_name = manifest.get("source_folder", "unknown")
+    session_id = manifest.get("session_id") or "legacy"
+
+    if not dest_drive_id:
+        print("  Error: session manifest is missing dest_drive_id — cannot verify.")
+        return
+
+    print(f"\n=== Verify Mode ===")
+    print(f"Session: {session_id}")
+    print(f"Source: {source_folder_name} → {manifest.get('dest_library', '?')}\n")
+
+    verify.set_session_dir(report.session_dir(session_id, source_folder_name))
+    run_dir = report.deep_verify_run_dir(session_id, source_folder_name)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve "root" alias — Graph never returns it as a parentReference.id
+    delta_root_id = dest_root_id
+    if delta_root_id == "root":
+        delta_root_id = graph.get_item(dest_drive_id, "root", token, select="id")["id"]
+
+    print("  Enumerating destination via delta...", end="", flush=True)
+    items, _delta_link = graph.get_folder_delta(
+        dest_drive_id, delta_root_id, token,
+        select="id,name,size,file,parentReference,deleted",
+    )
+    dest_lookup = verify.build_dest_path_lookup(items, delta_root_id)
+    print(f" {len(dest_lookup)} files indexed")
 
     total_issues = 0
     total_files = 0
 
     for batch_entry in manifest.get("batches", []):
-        batch_name = batch_entry["batch_name"]
-        batch_num = batch_entry["batch_number"]
+        batch_name = batch_entry.get("batch_name", "")
+        batch_num = batch_entry.get("batch_number", 0)
         source_files = batch_entry.get("files", [])
 
         if not source_files:
             continue
 
         print(f"\n> Batch {batch_num:02d} — {batch_name} ({len(source_files)} files)")
+        source_dicts = _manifest_to_source_dicts(source_files)
+        source_dicts = verify.compare_from_lookup(
+            source_dicts, dest_lookup, dest_drive_id, token
+        )
 
-        # Reconstruct source dicts with the fields verify needs
-        source_dicts = []
-        for f in source_files:
-            item = {
-                "id": f.get("source_id"),
-                "_path": f.get("source_path", ""),
-                "name": f.get("source_path", "").rsplit("/", 1)[-1],
-                "size": f.get("size", 0),
-                "file": {"hashes": {"quickXorHash": f.get("quickXorHash", "")}} if f.get("quickXorHash") else {},
-            }
-            source_dicts.append(item)
-
-        # Find dest folder
-        dest_batch_folder = _find_dest_folder(dest_drive_id, dest_root_id, batch_name, token)
-        if dest_batch_folder:
-            source_dicts = verify.fetch_and_compare(
-                source_dicts, dest_drive_id, dest_batch_folder["id"], token
-            )
-        else:
-            print(f"  Warning: dest folder '{batch_name}' not found")
-            for f in source_dicts:
-                f["verify_status"] = "MISSING"
-                f["verify_notes"] = "Dest folder not found"
-
-        # Write updated CSV
         csv_path = report.write_batch_csv(
-            source_folder_name, batch_num, batch_name, source_dicts
+            source_folder_name, batch_num, batch_name, source_dicts, run_dir=run_dir
         )
         print(f"  CSV written: {csv_path}")
 
-        ok_statuses = {"OK", "OK_SP_OVERHEAD", "OK_IMAGE_META"}
-        batch_issues = sum(1 for f in source_dicts if f.get("verify_status") not in ok_statuses)
+        batch_issues = sum(1 for f in source_dicts if f.get("verify_status") not in _OK_STATUSES)
         total_issues += batch_issues
         total_files += len(source_dicts)
 
-    print(f"\n=== Verification complete — {total_files} files, {total_issues} issues ===\n")
+    print(f"\n=== Verification complete — {total_files} files, {total_issues} issues ===")
+    print(f"Results: {run_dir}\n")
+
+
+def _verify_adhoc(token: str, default_upn: str = "") -> None:
+    """
+    Manual verify: pick source and dest interactively, no session required.
+    Enumerates source files recursively, enumerates dest via delta, then compares.
+    Groups results by top-level subfolder (one CSV per group).
+    """
+    print("\n=== Verify (manual) ===\n")
+
+    source_drive_id, source_folder_id, source_folder_name, _upn = _pick_source(
+        token, default_upn, step_prefix="[1] "
+    )
+    dest_drive_id, dest_root_id, _site, _lib = _pick_dest(token, step_prefix="[2] ")
+
+    # Enumerate source
+    print(f"\n[3] Enumerating source files...")
+    source_files = graph.enumerate_recursive(source_drive_id, source_folder_id, "", token)
+    if not source_files:
+        print("  No files found in source folder. Exiting.")
+        return
+    print(f"  {len(source_files)} files found")
+
+    # Enumerate dest via delta
+    delta_root_id = dest_root_id
+    if delta_root_id == "root":
+        delta_root_id = graph.get_item(dest_drive_id, "root", token, select="id")["id"]
+
+    print("  Enumerating destination via delta...", end="", flush=True)
+    items, _delta_link = graph.get_folder_delta(
+        dest_drive_id, delta_root_id, token,
+        select="id,name,size,file,parentReference,deleted",
+    )
+    dest_lookup = verify.build_dest_path_lookup(items, delta_root_id)
+    print(f" {len(dest_lookup)} files indexed")
+
+    # Group source files by top-level subfolder for per-group CSV output
+    from collections import defaultdict
+    groups: dict[str, list] = defaultdict(list)
+    for f in source_files:
+        top = f["_path"].split("/")[0] if "/" in f["_path"] else "(root files)"
+        groups[top].append(f)
+
+    run_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+    run_dir = report.LOGS_DIR / f"{run_id}_verify_{report._safe(source_folder_name)}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    verify.set_session_dir(run_dir)  # delta tokens go in run_dir/delta/ if needed
+
+    print(f"\n[4] Verifying {len(source_files)} files in {len(groups)} group(s)...")
+    total_issues = 0
+    total_files = 0
+
+    for batch_num, group_name in enumerate(sorted(groups.keys()), 1):
+        files = groups[group_name]
+        print(f"\n> {group_name} ({len(files)} files)")
+        verified = verify.compare_from_lookup(files, dest_lookup, dest_drive_id, token)
+        csv_path = report.write_batch_csv(
+            source_folder_name, batch_num, group_name, verified,
+            run_dir=run_dir,
+        )
+        print(f"  CSV written: {csv_path}")
+        total_issues += sum(1 for f in verified if f.get("verify_status") not in _OK_STATUSES)
+        total_files += len(verified)
+
+    print(f"\n=== Verification complete — {total_files} files, {total_issues} issues ===")
+    print(f"Results: {run_dir}\n")
 
 
 def _verify_root_files(files: list[dict], dest_drive_id: str, token: str) -> None:

@@ -51,7 +51,7 @@ The tool is orchestrated by `migrate.py` and splits concerns across these module
 
 **Parallel execution:** `--parallel N` (max 4) runs folder copies concurrently via ThreadPoolExecutor. Root files always run sequentially first.
 
-**Verify-only mode:** `--verify-only MANIFEST` re-verifies all batches from a session manifest without copying.
+**Verification:** All verify paths (menu `[Verify]`, `[Verify (manual)]`, `--verify-only`) use a single delta walk of the dest root — one API pass enumerates all files, then every source manifest file is matched by relative path. No per-folder enumeration. `--verify-only MANIFEST` re-verifies a session manifest from the CLI.
 
 ## Auth Setup (Azure)
 

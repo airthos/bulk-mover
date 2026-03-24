@@ -6,19 +6,34 @@ from typing import Optional
 
 import graph
 
-DELTA_DIR = Path("migration-logs/delta")
+_delta_dir: Path = Path("migration-logs/delta")
+
+
+def set_session_dir(path: Path) -> None:
+    """Set the session directory; delta sidecars will be written to {path}/delta/."""
+    global _delta_dir
+    _delta_dir = path / "delta"
 
 HASH_RETRY_COUNT = 3
 HASH_RETRY_DELAY = 10  # seconds
 
 # SharePoint's content pipeline injects co-authoring XML into Office docs,
-# adding ~6-8 KB. Size mismatches within this range are expected.
-_OFFICE_EXTENSIONS = frozenset({".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt"})
-_SP_OVERHEAD_MAX = 10_000  # bytes
+# adding ~6-15 KB. Size mismatches within this range are expected.
+# Includes template variants (.dotx, .dotm, .xlsm, .xlsb, .potx) — SP treats
+# them identically to their base formats for co-authoring overhead.
+_OFFICE_EXTENSIONS = frozenset({
+    ".docx", ".dotx", ".dotm",
+    ".xlsx", ".xlsm", ".xlsb",
+    ".pptx", ".potx",
+    ".doc", ".xls", ".ppt",
+})
+_SP_OVERHEAD_MAX = 15_000  # bytes — observed max ~11.8 KB; 15 KB gives headroom
 
 # SharePoint rewrites image metadata (EXIF, ICC, tEXt chunks) on ingestion.
-# Same-size + different-hash on images is benign — pixel data is intact.
+# This can change the hash even when sizes match, OR add a small number of
+# bytes (e.g. ICC profile injection). Both are benign — pixel data is intact.
 _IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".tiff", ".tif", ".heic", ".gif", ".bmp"})
+_IMAGE_OVERHEAD_MAX = 25_000  # bytes — observed max ~17.5 KB; 25 KB gives headroom
 
 
 def _ext(item: dict) -> str:
@@ -36,10 +51,14 @@ def compare_file(source: dict, dest: dict) -> tuple[str, str]:
     ext = _ext(source)
 
     if source_size != dest_size:
-        # Office docs: SharePoint adds co-authoring XML — dest is slightly larger
-        if ext in _OFFICE_EXTENSIONS and 0 < (dest_size - source_size) <= _SP_OVERHEAD_MAX:
-            return "OK_SP_OVERHEAD", f"dest +{dest_size - source_size}B (Office co-authoring XML)"
-        return "SIZE_MISMATCH", f"source={source_size} dest={dest_size}"
+        delta = dest_size - source_size
+        # Office docs/templates: SharePoint adds co-authoring XML — dest slightly larger
+        if ext in _OFFICE_EXTENSIONS and 0 < delta <= _SP_OVERHEAD_MAX:
+            return "OK_SP_OVERHEAD", f"dest +{delta}B (Office co-authoring XML)"
+        # Images: SharePoint may inject ICC/EXIF metadata — dest slightly larger
+        if ext in _IMAGE_EXTENSIONS and 0 < delta <= _IMAGE_OVERHEAD_MAX:
+            return "OK_IMAGE_META", f"dest +{delta}B (image metadata rewrite)"
+        return "SIZE_MISMATCH", f"source={source_size} dest={dest_size} delta={delta:+d}"
 
     source_hash = (source.get("file") or {}).get("hashes", {}).get("quickXorHash")
     dest_hash = (dest.get("file") or {}).get("hashes", {}).get("quickXorHash")
@@ -50,7 +69,7 @@ def compare_file(source: dict, dest: dict) -> tuple[str, str]:
     if source_hash and source_hash != dest_hash:
         # Images: SharePoint rewrites ancillary metadata — hash mismatch is expected
         if ext in _IMAGE_EXTENSIONS:
-            return "OK_IMAGE_META", f"hash differs (image metadata rewrite)"
+            return "OK_IMAGE_META", "hash differs (image metadata rewrite)"
         return "HASH_MISMATCH", f"source={source_hash} dest={dest_hash}"
 
     return "OK", ""
@@ -195,7 +214,7 @@ def _retry_hash_pending_batched(
 # ---------------------------------------------------------------------------
 
 def _delta_link_path(drive_id: str) -> Path:
-    return DELTA_DIR / f"{drive_id}.deltalink.json"
+    return _delta_dir / f"{drive_id}.deltalink.json"
 
 
 def load_delta_link(drive_id: str) -> str | None:
@@ -210,8 +229,121 @@ def load_delta_link(drive_id: str) -> str | None:
 
 
 def save_delta_link(drive_id: str, delta_link: str) -> None:
-    DELTA_DIR.mkdir(parents=True, exist_ok=True)
+    _delta_dir.mkdir(parents=True, exist_ok=True)
     _delta_link_path(drive_id).write_text(json.dumps({"deltaLink": delta_link}))
+
+
+def build_dest_path_lookup(
+    items: list[dict],
+    dest_root_id: str,
+) -> dict[str, dict]:
+    """
+    Build {relative_path: item} lookup from a flat delta response.
+
+    Uses id-based tree walk to reconstruct paths relative to dest_root_id.
+    parentReference.path is unreliable in delta responses, so we walk the
+    id chain instead. Only files (with 'file' facet) are included; deleted
+    items and folders are excluded from the result but kept for path resolution.
+
+    If dest_root_id is the literal string 'root', the actual root GUID is
+    resolved from the delta items (the folder with no parentReference.id).
+    This handles the case where the migration targeted the library root.
+    """
+    by_id: dict[str, dict] = {
+        item["id"]: item for item in items if not item.get("deleted")
+    }
+
+    # Resolve literal "root" to the actual drive root GUID so that the
+    # parent-chain walk terminates correctly at the right anchor.
+    if dest_root_id == "root":
+        for item in items:
+            if "folder" in item and not item.get("deleted"):
+                parent_id = (item.get("parentReference") or {}).get("id")
+                if not parent_id:
+                    dest_root_id = item["id"]
+                    break
+
+    def _rel_path(item: dict) -> str | None:
+        parts = [item["name"]]
+        current = item
+        for _ in range(50):  # guard against cycles
+            parent_ref = current.get("parentReference") or {}
+            parent_id = parent_ref.get("id")
+            if not parent_id or parent_id == dest_root_id:
+                break
+            parent = by_id.get(parent_id)
+            if not parent:
+                return None  # parent not in delta set — skip
+            parts.append(parent["name"])
+            current = parent
+        parts.reverse()
+        return "/".join(parts)
+
+    result: dict[str, dict] = {}
+    for item in items:
+        if item.get("deleted") or "file" not in item:
+            continue
+        rel = _rel_path(item)
+        if rel:
+            result[rel] = item
+    return result
+
+
+def compare_from_lookup(
+    source_files: list[dict],
+    dest_lookup: dict[str, dict],
+    dest_drive_id: str,
+    token: str,
+) -> list[dict]:
+    """
+    Compare source files against a pre-built {rel_path: dest_item} lookup.
+    Annotates each source file with verify_status, verify_notes, dest_id.
+
+    rel_path key is the full source path (source['_path']), since dest_lookup
+    is built relative to dest_root and source paths use the same convention.
+    """
+    print("  Verifying...", end="", flush=True)
+
+    hash_pending: list[dict] = []
+
+    for source in source_files:
+        if source.get("copy_status") == "COPY_FAILED":
+            source["verify_status"] = "COPY_FAILED"
+            source["verify_notes"] = source.get("copy_notes", "")
+            continue
+
+        rel_path = source.get("_path", "").lstrip("/")
+        dest = dest_lookup.get(rel_path)
+
+        if dest is None:
+            source["verify_status"] = "MISSING"
+            source["verify_notes"] = "File not found at destination"
+            source["dest_id"] = None
+            continue
+
+        source["dest_id"] = dest["id"]
+        source["dest_sharepointIds"] = dest.get("sharepointIds")
+
+        status, notes = compare_file(source, dest)
+
+        if status == "HASH_PENDING":
+            hash_pending.append(source)
+        else:
+            source["verify_status"] = status
+            source["verify_notes"] = notes
+
+    if hash_pending:
+        _retry_hash_pending_batched(hash_pending, dest_drive_id, token)
+
+    total = len(source_files)
+    ok_statuses = {"OK", "OK_SP_OVERHEAD", "OK_IMAGE_META"}
+    issues = sum(1 for f in source_files if f.get("verify_status") not in ok_statuses)
+    if issues == 0:
+        print(f" ✓ All {total} files verified OK")
+    else:
+        print(f" ⚠  {issues}/{total} files have issues")
+
+    return source_files
 
 
 def fetch_dest_items_delta(

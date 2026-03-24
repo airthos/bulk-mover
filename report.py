@@ -19,6 +19,19 @@ def _safe(name: str) -> str:
     return name.replace("/", "-").replace(" ", "-").replace("'", "")
 
 
+def _session_id_safe(session_id: str) -> str:
+    """Convert e.g. '2026-03-24T12:00:00Z' → '2026-03-24T120000Z' for use in path names."""
+    return session_id.replace(":", "")
+
+
+def session_dir(session_id: str | None, source_folder: str) -> Path:
+    """Return the per-session log directory path (not yet created)."""
+    if not session_id:
+        return LOGS_DIR / _safe(source_folder)
+    dirname = f"{_session_id_safe(session_id)}_{_safe(source_folder)}"
+    return LOGS_DIR / dirname
+
+
 # ---------------------------------------------------------------------------
 # Source file helpers
 # ---------------------------------------------------------------------------
@@ -61,17 +74,33 @@ CSV_FIELDS = [
 ]
 
 
+def deep_verify_run_dir(session_id: str | None, source_folder: str) -> Path:
+    """Return a timestamped sub-run directory for a deep verify pass."""
+    sdir = session_dir(session_id, source_folder)
+    return sdir / f"deep-verify-{_date_prefix()}"
+
+
 def write_batch_csv(
     source_folder: str,
     batch_number: int,
     batch_name: str,
     files: list[dict],
+    session_id: str = "",
+    run_dir: "Path | None" = None,
 ) -> Path:
-    _ensure_logs_dir()
-    filename = (
-        LOGS_DIR
-        / f"{_date_prefix()}_{_safe(source_folder)}_batch-{batch_number:02d}_{_safe(batch_name)}.csv"
-    )
+    if run_dir is not None:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        filename = run_dir / f"batch-{batch_number:02d}_{_safe(batch_name)}.csv"
+    elif session_id:
+        sdir = session_dir(session_id, source_folder)
+        sdir.mkdir(parents=True, exist_ok=True)
+        filename = sdir / f"batch-{batch_number:02d}_{_safe(batch_name)}.csv"
+    else:
+        _ensure_logs_dir()
+        filename = (
+            LOGS_DIR
+            / f"{_date_prefix()}_{_safe(source_folder)}_batch-{batch_number:02d}_{_safe(batch_name)}.csv"
+        )
 
     ok = sum(1 for f in files if f.get("verify_status") == "OK")
     failed = sum(1 for f in files if f.get("copy_status") == "COPY_FAILED")
@@ -188,25 +217,39 @@ def mark_manifest_completed(manifest: dict) -> None:
 
 
 def save_manifest(manifest: dict, source_folder: str, session_id: str) -> Path:
-    _ensure_logs_dir()
-    date = session_id[:10]
-    filename = LOGS_DIR / f"{date}_{_safe(source_folder)}_session.manifest.json"
+    sdir = session_dir(session_id, source_folder)
+    sdir.mkdir(parents=True, exist_ok=True)
+    filename = sdir / "session.manifest.json"
     with open(filename, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2, default=str)
     return filename
 
 
-def find_incomplete_sessions() -> list[tuple[Path, dict]]:
-    """Find manifest files with status 'in_progress'. Returns [(path, manifest), ...]."""
+def _load_all_manifests() -> list[tuple[Path, dict]]:
+    """Load all session manifests, newest first."""
     _ensure_logs_dir()
     results = []
-    for p in sorted(LOGS_DIR.glob("*_session.manifest.json"), reverse=True):
+    candidates = sorted(
+        list(LOGS_DIR.glob("*/session.manifest.json"))
+        + list(LOGS_DIR.glob("*_session.manifest.json")),
+        reverse=True,
+    )
+    for p in candidates:
         try:
             with open(p, encoding="utf-8") as fh:
                 manifest = json.load(fh)
-            if manifest.get("status") == "in_progress":
-                results.append((p, manifest))
+            results.append((p, manifest))
         except (json.JSONDecodeError, OSError):
             continue
     return results
+
+
+def find_incomplete_sessions() -> list[tuple[Path, dict]]:
+    """Find manifest files with status 'in_progress'. Returns [(path, manifest), ...]."""
+    return [(p, m) for p, m in _load_all_manifests() if m.get("status") == "in_progress"]
+
+
+def find_all_sessions() -> list[tuple[Path, dict]]:
+    """Find all session manifests regardless of status. Returns [(path, manifest), ...]."""
+    return _load_all_manifests()
 

@@ -5,7 +5,17 @@ import graph
 import verify
 import report
 
-PENDING_JOBS_FILE = Path("migration-logs/pending-jobs.json")
+_session_dir: Path = Path("migration-logs")
+
+
+def set_session_dir(path: Path) -> None:
+    """Set the directory where pending-jobs.json will be written for this session."""
+    global _session_dir
+    _session_dir = path
+
+
+def _pending_jobs_file() -> Path:
+    return _session_dir / "pending-jobs.json"
 
 
 # ---------------------------------------------------------------------------
@@ -264,17 +274,19 @@ def _mark_all(files: list[dict], status: str, notes: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _load_pending_jobs() -> dict:
-    if PENDING_JOBS_FILE.exists():
+    p = _pending_jobs_file()
+    if p.exists():
         try:
-            return json.loads(PENDING_JOBS_FILE.read_text())
+            return json.loads(p.read_text())
         except (json.JSONDecodeError, OSError):
             return {}
     return {}
 
 
 def _save_pending_jobs(jobs: dict) -> None:
-    PENDING_JOBS_FILE.parent.mkdir(exist_ok=True)
-    PENDING_JOBS_FILE.write_text(json.dumps(jobs, indent=2))
+    p = _pending_jobs_file()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(jobs, indent=2))
 
 
 def _load_pending_job(batch_name: str) -> str | None:

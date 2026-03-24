@@ -372,6 +372,44 @@ def get_drive_delta(
     return items, new_delta_link
 
 
+def get_folder_delta(
+    drive_id: str,
+    folder_id: str,
+    token: str,
+    delta_link: str | None = None,
+    select: str | None = None,
+) -> tuple[list[dict], str]:
+    """
+    Enumerate all descendants of a specific folder using delta query.
+    More efficient than recursive /children for deep trees (10–50 calls vs 500–5000+).
+
+    If delta_link is provided, fetches only changes since that token (incremental).
+    Returns (items, new_delta_link) where items is a flat list of all descendants.
+    """
+    if delta_link:
+        url = delta_link
+        params = None
+    else:
+        url = f"{GRAPH_BASE}/drives/{drive_id}/items/{folder_id}/delta"
+        params = {}
+        if select:
+            params["$select"] = select
+
+    items: list[dict] = []
+    new_delta_link = ""
+
+    while url:
+        resp = _request("GET", url, token, params=params)
+        data = resp.json()
+        items.extend(data.get("value", []))
+        url = data.get("@odata.nextLink")
+        params = None  # nextLink has params baked in
+        if "@odata.deltaLink" in data:
+            new_delta_link = data["@odata.deltaLink"]
+
+    return items, new_delta_link
+
+
 def patch_list_item_fields(
     site_id: str,
     list_id: str,

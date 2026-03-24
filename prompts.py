@@ -5,45 +5,71 @@ import inquirer
 
 
 # ---------------------------------------------------------------------------
-# Session resume
+# Startup action menu
 # ---------------------------------------------------------------------------
 
-def prompt_resume_session(sessions: list[tuple[Path, dict]]) -> dict | None:
+def prompt_startup_action(
+    incomplete_sessions: list[tuple[Path, dict]],
+    all_sessions: list[tuple[Path, dict]],
+) -> tuple[str, dict | None]:
     """
-    Ask the user if they want to resume an incomplete session.
-    Returns the manifest dict to resume, or None to start fresh.
+    Show a startup menu. Returns (action, manifest) where action is one of:
+    'new', 'resume', 'verify', 'verify_manual'. manifest is None for
+    'new' and 'verify_manual'.
     """
-    choices = ["[Start new session]"]
-    for path, manifest in sessions:
+    choices = ["[New migration]", "[Verify (manual — pick source & dest)]"]
+    session_map: dict[str, tuple[str, dict]] = {}
+
+    for _path, manifest in incomplete_sessions:
         completed = len(manifest.get("batches", []))
         total = len(manifest.get("batch_names", []))
         label = (
-            f"{manifest['source_folder']} → {manifest['dest_library']} "
-            f"({completed}/{total} batches) — {manifest['session_id']}"
+            f"[Resume]  {manifest.get('source_folder', '?')} → "
+            f"{manifest.get('dest_library', '?')} "
+            f"({completed}/{total} batches done)  {manifest.get('session_id', '')}"
         )
         choices.append(label)
+        session_map[label] = ("resume", manifest)
+
+    for _path, manifest in all_sessions:
+        if manifest.get("status") != "completed":
+            continue
+        total = len(manifest.get("batch_names") or manifest.get("batches", []))
+        label = (
+            f"[Verify]  {manifest.get('source_folder', '?')} → "
+            f"{manifest.get('dest_library', '?')} "
+            f"({total} batches)  {manifest.get('session_id', '')}"
+        )
+        choices.append(label)
+        session_map[label] = ("verify", manifest)
 
     answers = inquirer.prompt([
-        inquirer.List("session", message="Resume an incomplete session?", choices=choices)
+        inquirer.List("action", message="What would you like to do?", choices=choices)
     ])
-    selected = answers["session"]
+    selected = answers["action"]
 
-    if selected == "[Start new session]":
-        return None
+    if selected == "[New migration]":
+        return "new", None
+    if selected == "[Verify (manual — pick source & dest)]":
+        return "verify_manual", None
 
-    idx = choices.index(selected) - 1  # offset for [Start new session]
-    return sessions[idx][1]
+    action, manifest = session_map[selected]
+    return action, manifest
 
 
 # ---------------------------------------------------------------------------
 # Source
 # ---------------------------------------------------------------------------
 
-def prompt_source_upn() -> str:
+def prompt_source_upn(default: str = "") -> str:
     answers = inquirer.prompt([
-        inquirer.Text("upn", message="Enter OneDrive user UPN (e.g. brendan@airtho.com)")
+        inquirer.Text(
+            "upn",
+            message="Enter OneDrive user UPN",
+            default=default,
+        )
     ])
-    return answers["upn"].strip()
+    return (answers["upn"] or default).strip()
 
 
 def prompt_source_folder(folders: list[dict]) -> dict:
@@ -106,10 +132,11 @@ def prompt_dest_site() -> str:
     answers = inquirer.prompt([
         inquirer.Text(
             "site",
-            message="Enter SharePoint site (e.g. airtho.sharepoint.com/sites/Airtho)",
+            message="Enter SharePoint site",
+            default="airtho.sharepoint.com/sites/Airtho",
         )
     ])
-    return answers["site"].strip()
+    return (answers["site"] or "airtho.sharepoint.com/sites/Airtho").strip()
 
 
 def prompt_dest_library(drives: list[dict]) -> dict:

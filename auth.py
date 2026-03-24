@@ -57,3 +57,24 @@ def get_access_token() -> str:
     username = result.get("id_token_claims", {}).get("preferred_username", "unknown")
     print(f"Signed in as {username}\n")
     return result["access_token"]
+
+
+def get_signed_in_upn() -> str | None:
+    """Return the UPN of the cached signed-in user without making a network call."""
+    client_id = os.environ.get("AZURE_CLIENT_ID")
+    tenant_id = os.environ.get("AZURE_TENANT_ID")
+    if not client_id or not tenant_id:
+        return None
+    try:
+        cache = _load_cache()
+        app = msal.PublicClientApplication(
+            client_id=client_id,
+            authority=AUTHORITY.format(tenant_id=tenant_id),
+            token_cache=cache,
+        )
+        accounts = app.get_accounts()
+        if accounts:
+            return accounts[0].get("username")
+    except Exception:
+        pass
+    return None
