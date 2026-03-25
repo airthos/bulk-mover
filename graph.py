@@ -394,21 +394,40 @@ def get_folder_delta(
 
     If delta_link is provided, fetches only changes since that token (incremental).
     Returns (items, new_delta_link) where items is a flat list of all descendants.
+
+    Handles 410 Gone (stale delta token) by falling back to full enumeration.
     """
+    import requests as _req
+
+    _original_delta_link = delta_link  # for 410 detection — only fallback once
+
     if delta_link:
         url = delta_link
         params = None
     else:
         url = f"{GRAPH_BASE}/drives/{drive_id}/items/{folder_id}/delta"
-        params = {}
-        if select:
-            params["$select"] = select
+        params = {"$select": select} if select else None
 
     items: list[dict] = []
     new_delta_link = ""
 
     while url:
-        resp = _request("GET", url, token, params=params)
+        try:
+            resp = _request("GET", url, token, params=params)
+        except _req.HTTPError as exc:
+            if (
+                _original_delta_link
+                and exc.response is not None
+                and exc.response.status_code == 410
+            ):
+                # Stale delta token — restart with a full enumeration
+                _original_delta_link = None
+                url = f"{GRAPH_BASE}/drives/{drive_id}/items/{folder_id}/delta"
+                params = {"$select": select} if select else None
+                items = []
+                new_delta_link = ""
+                continue
+            raise
         data = resp.json()
         items.extend(data.get("value", []))
         url = data.get("@odata.nextLink")

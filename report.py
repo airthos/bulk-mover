@@ -74,6 +74,12 @@ CSV_FIELDS = [
 ]
 
 
+def resync_run_dir(session_id: str | None, source_folder: str) -> Path:
+    """Return a timestamped sub-run directory for a resync pass."""
+    sdir = session_dir(session_id, source_folder)
+    return sdir / f"resync-{_date_prefix()}"
+
+
 def deep_verify_run_dir(session_id: str | None, source_folder: str) -> Path:
     """Return a timestamped sub-run directory for a deep verify pass."""
     sdir = session_dir(session_id, source_folder)
@@ -180,6 +186,87 @@ def write_dest_only_csv(dest_only_items: list[dict], run_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Resync reports
+# ---------------------------------------------------------------------------
+
+_RESYNC_CHANGES_FIELDS = [
+    "batch", "source_path", "change_type", "size", "last_modified_source", "notes"
+]
+_RESYNC_REMOVALS_FIELDS = [
+    "source_path", "size", "last_modified_source", "notes"
+]
+
+
+def write_resync_changes_csv(
+    source_folder: str,
+    batch_number: int,
+    batch_name: str,
+    added: list[dict],
+    modified: list[dict],
+    run_dir: Path,
+) -> Path:
+    """Write per-batch CSV of added and modified files detected during a resync."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    filename = run_dir / f"batch-{batch_number:02d}_{_safe(batch_name)}.csv"
+    with open(filename, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_RESYNC_CHANGES_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for f in added:
+            writer.writerow({
+                "batch": batch_name,
+                "source_path": f.get("_path", ""),
+                "change_type": "ADDED",
+                "size": f.get("size", ""),
+                "last_modified_source": _modified_dt(f),
+                "notes": "",
+            })
+        for f in modified:
+            writer.writerow({
+                "batch": batch_name,
+                "source_path": f.get("_path", ""),
+                "change_type": "MODIFIED",
+                "size": f.get("size", ""),
+                "last_modified_source": _modified_dt(f),
+                "notes": f.get("_change_note", ""),
+            })
+        writer.writerow({
+            "batch": "SUMMARY",
+            "source_path": f"added={len(added)}, modified={len(modified)}",
+            "change_type": "",
+            "size": "",
+            "last_modified_source": "",
+            "notes": "",
+        })
+    return filename
+
+
+def write_resync_removals_csv(removed: list[dict], run_dir: Path) -> Path:
+    """
+    Write a single removals CSV listing source files that no longer exist in OneDrive.
+    These are logged only — nothing is deleted from the destination.
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    filename = run_dir / "removals.csv"
+    with open(filename, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_RESYNC_REMOVALS_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for f in removed:
+            writer.writerow({
+                "source_path": f.get("source_path", ""),
+                "size": f.get("size", ""),
+                "last_modified_source": f.get("lastModifiedDateTime", ""),
+                "notes": "Removed from source OneDrive — NOT deleted from destination",
+            })
+        writer.writerow({
+            "source_path": f"SUMMARY: total={len(removed)}",
+            "size": "",
+            "last_modified_source": "",
+            "notes": "",
+        })
+    return filename
+
+
+# ---------------------------------------------------------------------------
 # Session manifest
 # ---------------------------------------------------------------------------
 
@@ -217,10 +304,12 @@ def add_batch_to_manifest(
     batch_name: str,
     batch_number: int,
     files: list[dict],
+    source_item_id: str = "",
 ) -> None:
     batch_entry = {
         "batch_name": batch_name,
         "batch_number": batch_number,
+        "source_item_id": source_item_id,
         "files": [],
     }
     for item in files:

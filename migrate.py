@@ -38,6 +38,11 @@ def main() -> None:
         default=None,
         help="Override parallel worker count (default: auto, up to 6)",
     )
+    parser.add_argument(
+        "--resync",
+        metavar="MANIFEST",
+        help="Re-sync source OneDrive against dest SharePoint from a session manifest; copies only changed files",
+    )
     args = parser.parse_args()
 
     if args.parallel is not None:
@@ -46,6 +51,18 @@ def main() -> None:
     print("\n=== OneDrive → SharePoint Migration Tool ===\n")
 
     # Flag-based dispatch (scripting / CI use)
+    if args.resync:
+        path = Path(args.resync)
+        if not path.exists():
+            print(f"Error: manifest not found: {args.resync}")
+            sys.exit(1)
+        with open(path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        token = auth.get_access_token()
+        graph.register_token_refresher(auth.get_access_token)
+        _run_resync(manifest, token)
+        return
+
     if args.verify_only:
         path = Path(args.verify_only)
         if not path.exists():
@@ -415,7 +432,10 @@ def _run_batches(
             )
 
             with manifest_lock:
-                report.add_batch_to_manifest(manifest, b["name"], b["number"], files)
+                report.add_batch_to_manifest(
+                    manifest, b["name"], b["number"], files,
+                    source_item_id=b.get("item_id", ""),
+                )
                 report.save_manifest(manifest, source_folder_name, session_id)
 
             if tui:
@@ -688,6 +708,151 @@ def _verify_root_files(
         f["verify_status"] = status
         f["verify_notes"] = notes
         f["dest_id"] = dest_id
+
+
+def _run_resync(manifest: dict, token: str) -> None:
+    """
+    Re-sync source OneDrive against dest SharePoint from a completed session manifest.
+
+    Per batch:
+      - Re-enumerate source files (fresh full scan)
+      - Diff against the manifest's stored file list (by path, size, lastModifiedDateTime)
+      - If any files added or modified: re-copy the entire batch folder with conflict_behavior="replace"
+      - Log added/modified files to per-batch CSV; log removed files to a single removals CSV
+      - Persist source_item_id per batch for subsequent resyncs
+
+    Removals (files deleted from OneDrive) are only logged — nothing is deleted from SharePoint.
+    """
+    source_drive_id = manifest.get("source_drive_id", "")
+    source_folder_id = manifest.get("source_folder_id", "")
+    source_folder_name = manifest.get("source_folder", "unknown")
+    dest_drive_id = manifest.get("dest_drive_id", "")
+    dest_root_id = manifest.get("dest_root_id") or "root"
+    session_id = manifest.get("session_id") or "legacy"
+
+    print(f"\n=== Resync ===")
+    print(f"Session: {session_id}")
+    print(f"Source: {source_folder_name} → {manifest.get('dest_library', '?')}\n")
+
+    if not source_drive_id or not dest_drive_id:
+        print("  Error: manifest missing source or dest drive IDs — cannot resync.")
+        return
+
+    run_dir = report.resync_run_dir(session_id, source_folder_name)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Shallow re-scan to get current item_ids (stable IDs, fast one-level scan)
+    print("  Re-scanning source batches...", end="", flush=True)
+    current_batches = batch_mod.scan_batches(source_drive_id, source_folder_id, token)
+    current_batch_map = {b["name"]: b for b in current_batches}
+    print(f" {len(current_batches)} found")
+
+    all_removed: list[dict] = []
+    total_changed_batches = 0
+
+    for batch_entry in manifest.get("batches", []):
+        batch_name = batch_entry.get("batch_name", "")
+        batch_number = batch_entry.get("batch_number", 0)
+        stored_files = batch_entry.get("files", [])
+
+        # Root files batch uses per-file copy — skip for now (folder copy not applicable)
+        if not stored_files or not batch_entry.get("source_item_id") and batch_name == "Root files":
+            continue
+
+        source_item_id = batch_entry.get("source_item_id")
+        if not source_item_id:
+            current_batch = current_batch_map.get(batch_name)
+            if not current_batch or current_batch.get("is_root_files"):
+                print(f"\n  [{batch_number:02d}] {batch_name}: not found in source — skipping")
+                continue
+            source_item_id = current_batch["item_id"]
+
+        print(f"\n> [{batch_number:02d}] {batch_name}: enumerating...", end="", flush=True)
+        fresh_files = graph.enumerate_recursive(
+            source_drive_id, source_item_id, batch_name, token
+        )
+        print(f" {len(fresh_files)} files")
+
+        fresh_by_path = {f["_path"]: f for f in fresh_files}
+        manifest_by_path = {
+            f["source_path"]: f
+            for f in stored_files
+            if f.get("copy_status") != "COPY_FAILED"
+        }
+
+        # Detect additions and modifications
+        added = [f for f in fresh_files if f["_path"] not in manifest_by_path]
+        modified = []
+        for f in fresh_files:
+            manifest_f = manifest_by_path.get(f["_path"])
+            if manifest_f is None:
+                continue  # new file, handled in added
+            fresh_mtime = (
+                (f.get("fileSystemInfo") or {}).get("lastModifiedDateTime")
+                or f.get("lastModifiedDateTime", "")
+            )
+            stored_mtime = manifest_f.get("lastModifiedDateTime", "")
+            fresh_size = f.get("size", 0)
+            stored_size = manifest_f.get("size", 0)
+            if fresh_size != stored_size:
+                f["_change_note"] = f"size: {stored_size} → {fresh_size}"
+                modified.append(f)
+            elif fresh_mtime and stored_mtime and fresh_mtime > stored_mtime:
+                f["_change_note"] = f"mtime: {stored_mtime} → {fresh_mtime}"
+                modified.append(f)
+
+        # Detect removals (in manifest but gone from source)
+        removed = [
+            f for f in stored_files
+            if f.get("copy_status") != "COPY_FAILED"
+            and f.get("source_path", "") not in fresh_by_path
+        ]
+        all_removed.extend(removed)
+
+        if not added and not modified:
+            print(f"  No changes")
+            # Still persist source_item_id for future resyncs
+            batch_entry["source_item_id"] = source_item_id
+            continue
+
+        print(f"  {len(added)} added, {len(modified)} modified, {len(removed)} removed from source")
+        total_changed_batches += 1
+
+        csv_path = report.write_resync_changes_csv(
+            source_folder_name, batch_number, batch_name, added, modified, run_dir
+        )
+        print(f"  Changes CSV: {csv_path}")
+
+        # Re-copy the whole batch folder (server-side copy replaces in-place)
+        dest_batch = _find_dest_folder(dest_drive_id, dest_root_id, batch_name, token)
+        conflict = "replace" if dest_batch else None
+        print(f"  Re-copying {len(added) + len(modified)} changed file(s)...", end="", flush=True)
+        try:
+            location = graph.copy_item(
+                source_drive_id, source_item_id, dest_drive_id, dest_root_id, token,
+                conflict_behavior=conflict,
+            )
+            result = graph.poll_copy_job(location)
+            if result.get("status") == "completed":
+                print(" done.")
+            else:
+                error = result.get("error", {})
+                msg = f"{error.get('code', result.get('status', 'unknown'))}: {error.get('message', '')}"
+                print(f" FAILED — {msg}")
+                continue
+        except Exception as e:
+            print(f" ERROR: {e}")
+            continue
+
+        batch_entry["source_item_id"] = source_item_id
+
+    if all_removed:
+        removals_csv = report.write_resync_removals_csv(all_removed, run_dir)
+        print(f"\n  {len(all_removed)} file(s) removed from source — logged to: {removals_csv}")
+
+    report.save_manifest(manifest, source_folder_name, session_id)
+    print(f"\n=== Resync complete — {total_changed_batches} batch(es) re-copied ===")
+    print(f"Results: {run_dir}\n")
 
 
 if __name__ == "__main__":
