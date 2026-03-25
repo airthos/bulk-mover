@@ -529,6 +529,46 @@ def _manifest_to_source_dicts(files: list[dict]) -> list[dict]:
 
 _OK_STATUSES = {"OK", "OK_SP_OVERHEAD", "OK_IMAGE_META"}
 
+_ISSUE_LABELS = {
+    "MISSING":          "not found at destination",
+    "COPY_FAILED":      "copy failed",
+    "SIZE_MISMATCH":    "size differs at destination",
+    "HASH_MISMATCH":    "content differs at destination",
+    "HASH_PENDING":     "couldn't be verified (hash not ready — re-verify later)",
+    "HASH_UNAVAILABLE": "couldn't be verified (source hash not recorded)",
+    "DEST_ONLY":        "only exists at destination, not in source",
+}
+
+
+def _print_verify_summary(files: list[dict], dest_only: list[dict] | None = None) -> None:
+    """Print a human-readable summary of verification issues."""
+    from collections import defaultdict
+    by_status: dict[str, list[str]] = defaultdict(list)
+
+    for f in files:
+        status = f.get("verify_status", "")
+        if status in _OK_STATUSES or not status:
+            continue
+        path = f.get("_path") or f.get("source_path", "")
+        by_status[status].append(path)
+
+    if dest_only:
+        for f in dest_only:
+            by_status["DEST_ONLY"].append(f.get("_dest_path", ""))
+
+    if not by_status:
+        print("  All files verified OK")
+        return
+
+    for status, paths in sorted(by_status.items(), key=lambda x: -len(x[1])):
+        label = _ISSUE_LABELS.get(status, status)
+        count = len(paths)
+        if count == 1:
+            name = paths[0].rsplit("/", 1)[-1] if paths[0] else "unknown"
+            print(f"  1 file {label}  \u2192  {name}")
+        else:
+            print(f"  {count} files {label}")
+
 
 def _verify_session(manifest: dict, token: str) -> None:
     """
@@ -595,14 +635,11 @@ def _verify_session(manifest: dict, token: str) -> None:
 
     dest_only = verify.find_dest_only(all_source_dicts, dest_lookup)
     if dest_only:
-        dest_only_csv = report.write_dest_only_csv(dest_only, run_dir)
-        print(f"\n  ⚠  {len(dest_only)} file(s) at destination not in source manifest")
-        print(f"  DEST_ONLY CSV: {dest_only_csv}")
-    else:
-        print(f"\n  ✓ No destination-only files")
+        report.write_dest_only_csv(dest_only, run_dir)
 
-    print(f"\n=== Verification complete — {total_files} files, {total_issues} issues ===")
-    print(f"Results: {run_dir}\n")
+    print(f"\n=== Verification complete — {total_files} files ===\n")
+    _print_verify_summary(all_source_dicts, dest_only)
+    print(f"\nResults: {run_dir}\n")
 
 
 def _verify_adhoc(token: str, default_upn: str = "") -> None:
@@ -668,14 +705,11 @@ def _verify_adhoc(token: str, default_upn: str = "") -> None:
 
     dest_only = verify.find_dest_only(source_files, dest_lookup)
     if dest_only:
-        dest_only_csv = report.write_dest_only_csv(dest_only, run_dir)
-        print(f"\n  ⚠  {len(dest_only)} file(s) at destination not in source")
-        print(f"  DEST_ONLY CSV: {dest_only_csv}")
-    else:
-        print(f"\n  ✓ No destination-only files")
+        report.write_dest_only_csv(dest_only, run_dir)
 
-    print(f"\n=== Verification complete — {total_files} files, {total_issues} issues ===")
-    print(f"Results: {run_dir}\n")
+    print(f"\n=== Verification complete — {total_files} files ===\n")
+    _print_verify_summary(source_files, dest_only)
+    print(f"\nResults: {run_dir}\n")
 
 
 def _verify_root_files(
