@@ -235,7 +235,6 @@ def _run_new_session(token: str, default_upn: str = "") -> None:
     )
     sdir = report.session_dir(session_id, source_folder_name)
     batch_mod.set_session_dir(sdir)
-    verify.set_session_dir(sdir)
     manifest_path = report.save_manifest(manifest, source_folder_name, session_id)
 
     _run_batches(batches, source_drive_id, dest_drive_id, dest_root_id,
@@ -280,7 +279,6 @@ def _run_resumed_session(manifest: dict, token: str) -> None:
     # Point session dir at the existing session folder
     sdir = report.session_dir(session_id, source_folder_name)
     batch_mod.set_session_dir(sdir)
-    verify.set_session_dir(sdir)
 
     # Filter to only incomplete batches
     remaining = [b for b in batches if b["name"] not in completed_names]
@@ -397,7 +395,7 @@ def _run_batches(
                 tui.update(b["name"], "verifying", file_count=len(files))
 
             if b["is_root_files"]:
-                _verify_root_files(files, dest_drive_id, token)
+                _verify_root_files(files, dest_drive_id, dest_root_id, token)
             else:
                 dest_batch_folder = _find_dest_folder(
                     dest_drive_id, dest_root_id, b["name"], token
@@ -522,7 +520,6 @@ def _verify_session(manifest: dict, token: str) -> None:
     print(f"Session: {session_id}")
     print(f"Source: {source_folder_name} → {manifest.get('dest_library', '?')}\n")
 
-    verify.set_session_dir(report.session_dir(session_id, source_folder_name))
     run_dir = report.deep_verify_run_dir(session_id, source_folder_name)
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -614,8 +611,6 @@ def _verify_adhoc(token: str, default_upn: str = "") -> None:
     run_dir = report.LOGS_DIR / f"{run_id}_verify_{report._safe(source_folder_name)}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    verify.set_session_dir(run_dir)  # delta tokens go in run_dir/delta/ if needed
-
     print(f"\n[4] Verifying {len(source_files)} files in {len(groups)} group(s)...")
     total_issues = 0
     total_files = 0
@@ -636,20 +631,41 @@ def _verify_adhoc(token: str, default_upn: str = "") -> None:
     print(f"Results: {run_dir}\n")
 
 
-def _verify_root_files(files: list[dict], dest_drive_id: str, token: str) -> None:
-    """Verify individually copied root files using their dest_resource_id."""
+def _verify_root_files(
+    files: list[dict], dest_drive_id: str, dest_root_id: str, token: str
+) -> None:
+    """Verify individually copied root files using their dest_resource_id.
+
+    Falls back to a name-based lookup in dest root when dest_resource_id is
+    absent (Graph copy job response doesn't always include resourceId).
+    The name lookup is fetched lazily and reused across all files.
+    """
+    dest_root_by_name: dict[str, dict] | None = None
+
     for f in files:
         if f.get("copy_status") == "COPY_FAILED":
             f["verify_status"] = "COPY_FAILED"
             continue
 
         dest_id = f.get("dest_resource_id")
-        if not dest_id:
-            f["verify_status"] = "MISSING"
-            f["verify_notes"] = "No dest resource ID recorded after copy"
-            continue
 
-        dest_item = graph.get_item(dest_drive_id, dest_id, token, select="id,size,file")
+        if not dest_id:
+            # Fetch dest root children once and match by filename
+            if dest_root_by_name is None:
+                children = graph.list_children(
+                    dest_drive_id, dest_root_id, token, select="id,name,size,file"
+                )
+                dest_root_by_name = {c["name"]: c for c in children if "file" in c}
+            name = f.get("name") or f.get("_path", "").rsplit("/", 1)[-1]
+            dest_item = dest_root_by_name.get(name)
+            if not dest_item:
+                f["verify_status"] = "MISSING"
+                f["verify_notes"] = "Not found at destination (no resourceId; name lookup failed)"
+                continue
+            dest_id = dest_item["id"]
+        else:
+            dest_item = graph.get_item(dest_drive_id, dest_id, token, select="id,size,file")
+
         status, notes = verify.compare_file(f, dest_item)
         f["verify_status"] = status
         f["verify_notes"] = notes

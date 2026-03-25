@@ -55,9 +55,9 @@ The tool is orchestrated by `migrate.py` and splits concerns across these module
 
 **Verify-then-skip:** Before re-copying a batch, checks if dest folder already has all files with matching size/hash. Skips copy if complete — prevents duplicate work on re-runs.
 
-**Conflict resolution:** Compare `lastModifiedDateTime` source vs destination before copying. Newer file wins. Destination-newer files are skipped and logged as `SKIPPED_DEST_NEWER`.
+**Verification statuses:** `OK`, `OK_SP_OVERHEAD`, `OK_IMAGE_META`, `SIZE_MISMATCH`, `HASH_MISMATCH`, `HASH_PENDING`, `HASH_UNAVAILABLE`, `MISSING`, `COPY_FAILED`
 
-**Verification statuses:** `OK`, `OK_SP_OVERHEAD`, `OK_IMAGE_META`, `SIZE_MISMATCH`, `HASH_MISMATCH`, `HASH_PENDING`, `MISSING`, `SKIPPED_DEST_NEWER`, `COPY_FAILED`
+`HASH_UNAVAILABLE` means the source hash was not recorded at enumeration time — file was verified by size only. This occurs when Graph API didn't return a quickXorHash for the source file (recently uploaded files). Not a failure, but weaker than a full hash check.
 
 **CSV output:** `./migration-logs/{date}_{source-folder}_{batch-number}_{batch-name}.csv`
 

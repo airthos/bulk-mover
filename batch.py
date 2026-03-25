@@ -297,7 +297,7 @@ def _verify_already_copied(
             break
 
         status, _ = verify.compare_file(source, dest)
-        if status not in ("OK", "OK_SP_OVERHEAD", "OK_IMAGE_META"):
+        if status not in ("OK", "OK_SP_OVERHEAD", "OK_IMAGE_META", "HASH_UNAVAILABLE"):
             all_ok = False
             break
 

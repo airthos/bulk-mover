@@ -1,18 +1,7 @@
-import json
 import os
 import time
-from pathlib import Path
-from typing import Optional
 
 import graph
-
-_delta_dir: Path = Path("migration-logs/delta")
-
-
-def set_session_dir(path: Path) -> None:
-    """Set the session directory; delta sidecars will be written to {path}/delta/."""
-    global _delta_dir
-    _delta_dir = path / "delta"
 
 HASH_RETRY_COUNT = 3
 HASH_RETRY_DELAY = 10  # seconds
@@ -66,7 +55,10 @@ def compare_file(source: dict, dest: dict) -> tuple[str, str]:
     if dest_hash is None:
         return "HASH_PENDING", "quickXorHash not yet computed at destination"
 
-    if source_hash and source_hash != dest_hash:
+    if source_hash is None:
+        return "HASH_UNAVAILABLE", "source hash not recorded — size-only check"
+
+    if source_hash != dest_hash:
         # Images: SharePoint rewrites ancillary metadata — hash mismatch is expected
         if ext in _IMAGE_EXTENSIONS:
             return "OK_IMAGE_META", "hash differs (image metadata rewrite)"
@@ -216,26 +208,6 @@ def _retry_hash_pending_batched(
 # Delta-based re-verification
 # ---------------------------------------------------------------------------
 
-def _delta_link_path(drive_id: str) -> Path:
-    return _delta_dir / f"{drive_id}.deltalink.json"
-
-
-def load_delta_link(drive_id: str) -> str | None:
-    p = _delta_link_path(drive_id)
-    if p.exists():
-        try:
-            data = json.loads(p.read_text())
-            return data.get("deltaLink")
-        except (json.JSONDecodeError, OSError):
-            return None
-    return None
-
-
-def save_delta_link(drive_id: str, delta_link: str) -> None:
-    _delta_dir.mkdir(parents=True, exist_ok=True)
-    _delta_link_path(drive_id).write_text(json.dumps({"deltaLink": delta_link}))
-
-
 def build_dest_path_lookup(
     items: list[dict],
     dest_root_id: str,
@@ -352,59 +324,3 @@ def compare_from_lookup(
     return source_files
 
 
-def fetch_dest_items_delta(
-    dest_drive_id: str,
-    token: str,
-) -> dict[str, dict]:
-    """
-    Fetch destination items using delta queries. On first call does a full sync.
-    Subsequent calls only fetch changes since the last delta token.
-    Returns items keyed by item ID.
-    """
-    delta_link = load_delta_link(dest_drive_id)
-    items, new_delta_link = graph.get_drive_delta(
-        dest_drive_id, token,
-        delta_link=delta_link,
-        select="id,name,size,file,parentReference,deleted",
-    )
-
-    if new_delta_link:
-        save_delta_link(dest_drive_id, new_delta_link)
-
-    # Build lookup by ID, excluding deleted items
-    result: dict[str, dict] = {}
-    for item in items:
-        if item.get("deleted"):
-            result.pop(item["id"], None)
-        elif "file" in item:
-            result[item["id"]] = item
-
-    return result
-
-
-def patch_metadata(
-    site_id: str,
-    list_id: str,
-    list_item_id: str,
-    created_dt: Optional[str],
-    modified_dt: Optional[str],
-    token: str,
-) -> str:
-    """
-    Attempt to restore Created and Modified dates on a SharePoint list item.
-    Returns 'METADATA_OK', 'METADATA_FAILED', or 'METADATA_SKIPPED'.
-    """
-    fields: dict = {}
-    if created_dt:
-        fields["Created"] = created_dt
-    if modified_dt:
-        fields["Modified"] = modified_dt
-
-    if not fields:
-        return "METADATA_SKIPPED"
-
-    try:
-        graph.patch_list_item_fields(site_id, list_id, list_item_id, fields, token)
-        return "METADATA_OK"
-    except Exception:
-        return "METADATA_FAILED"
