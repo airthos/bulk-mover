@@ -1,17 +1,27 @@
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import graph
 import verify
 import report
 
+if TYPE_CHECKING:
+    from tui import BatchTUI
+
 _session_dir: Path = Path("migration-logs")
+_tui: "BatchTUI | None" = None
 
 
 def set_session_dir(path: Path) -> None:
     """Set the directory where pending-jobs.json will be written for this session."""
     global _session_dir
     _session_dir = path
+
+
+def set_tui(tui: "BatchTUI | None") -> None:
+    global _tui
+    _tui = tui
 
 
 def _pending_jobs_file() -> Path:
@@ -89,7 +99,11 @@ def run_batch(
     batch_name = batch["name"]
     batch_num = batch["number"]
 
-    print(f"\n> Batch {batch_num:02d} — {batch_name}")
+    if _tui:
+        _tui.register(batch_name)
+        _tui.update(batch_name, "scanning")
+    else:
+        print(f"\n> Batch {batch_num:02d} — {batch_name}")
 
     # --- Enumerate source ---
     if batch.get("_files_cache") is not None:
@@ -98,16 +112,27 @@ def run_batch(
             if "_path" not in f:
                 f["_path"] = f.get("name", "")
     else:
-        print("  Enumerating source...", end="", flush=True)
+        if not _tui:
+            print("  Enumerating source...", end="", flush=True)
+
+        def _scan_progress(n: int) -> None:
+            if _tui:
+                _tui.update(batch_name, "scanning", file_count=n)
+
         source_files = graph.enumerate_recursive(
-            source_drive_id, batch["item_id"], batch_name, token
+            source_drive_id, batch["item_id"], batch_name, token,
+            progress_callback=_scan_progress,
         )
-        print(f" {len(source_files)} files")
+        if _tui:
+            _tui.update(batch_name, "copying", file_count=len(source_files))
+        else:
+            print(f" {len(source_files)} files")
 
     batch["file_count"] = len(source_files)
 
     if not source_files:
-        print("  No files found — skipping")
+        if not _tui:
+            print("  No files found — skipping")
         return []
 
     # --- Copy ---
@@ -134,45 +159,58 @@ def _copy_folder(
     if _verify_already_copied(batch_name, source_files, dest_drive_id, dest_root_id, token):
         return
 
-    # Check for a saved pending job from a previous timed-out run
+    # Check for a saved pending job from a previous run
     location = _load_pending_job(batch_name)
     if location:
-        print(f"  Resuming poll for {len(source_files)} files (saved job)...", end="", flush=True)
+        if _tui:
+            _tui.update(batch_name, "resuming", file_count=len(source_files))
+        else:
+            print(f"  Resuming poll for {len(source_files)} files (saved job)...", end="", flush=True)
     else:
-        print(f"  Copying {len(source_files)} files...", end="", flush=True)
+        if not _tui:
+            print(f"  Copying {len(source_files)} files...", end="", flush=True)
         try:
             location = graph.copy_item(
                 source_drive_id, batch["item_id"], dest_drive_id, dest_root_id, token
             )
+            # Save immediately so a kill mid-poll doesn't lose the URL
+            _save_pending_job(batch_name, location)
         except Exception as e:
-            print(f" ERROR: {e}")
+            if not _tui:
+                print(f" ERROR: {e}")
             _mark_all(source_files, "COPY_FAILED", str(e))
             return
 
     def _progress(pct, elapsed):
-        mins = int(elapsed) // 60
-        secs = int(elapsed) % 60
-        print(f"\r  Copying {len(source_files)} files... {pct:.0f}% ({mins}m{secs:02d}s)", end="", flush=True)
+        if _tui:
+            _tui.update(batch_name, "copying", pct=pct, file_count=len(source_files))
+        else:
+            mins = int(elapsed) // 60
+            secs = int(elapsed) % 60
+            print(f"\r  Copying {len(source_files)} files... {pct:.0f}% ({mins}m{secs:02d}s)", end="", flush=True)
 
     result = graph.poll_copy_job(location, progress_callback=_progress)
     status = result.get("status")
 
     if status == "completed":
         _clear_pending_job(batch_name)
-        print(" done.")
+        if not _tui:
+            print(" done.")
         for f in source_files:
             f["copy_status"] = "COMPLETED"
 
     elif status == "timeout":
         _save_pending_job(batch_name, result.get("_location", location))
-        print(f" TIMED OUT — location URL saved for resume.")
+        if not _tui:
+            print(f" TIMED OUT — location URL saved for resume.")
         _mark_all(source_files, "COPY_FAILED", "Polling timed out (URL saved for resume)")
 
     else:
         _clear_pending_job(batch_name)
         error = result.get("error", {})
         msg = f"{error.get('code', 'unknown')}: {error.get('message', status)}"
-        print(f" FAILED — {msg}")
+        if not _tui:
+            print(f" FAILED — {msg}")
         _mark_all(source_files, "COPY_FAILED", msg)
 
 
@@ -184,9 +222,18 @@ def _copy_root_files(
     token: str,
 ) -> None:
     """Copy individual files (no enclosing folder). Used for root-level files."""
-    from tqdm import tqdm
+    batch_name = "Root files"
+    total = len(source_files)
 
-    for f in tqdm(source_files, desc="  Root files", unit="file"):
+    if _tui:
+        iterator = enumerate(source_files, 1)
+    else:
+        from tqdm import tqdm
+        iterator = enumerate(tqdm(source_files, desc="  Root files", unit="file"), 1)
+
+    for i, f in iterator:
+        if _tui:
+            _tui.update(batch_name, "copying", pct=round(i / total * 100), file_count=total)
         try:
             location = graph.copy_item(
                 source_drive_id, f["id"], dest_drive_id, dest_root_id, token
@@ -229,7 +276,8 @@ def _verify_already_copied(
         return False
 
     # Enumerate dest and compare
-    print(f"  Dest folder exists — verifying before re-copy...", end="", flush=True)
+    if not _tui:
+        print(f"  Dest folder exists — verifying before re-copy...", end="", flush=True)
     dest_files_raw = graph.enumerate_recursive(
         dest_drive_id, dest_folder["id"], "", token
     )
@@ -254,12 +302,14 @@ def _verify_already_copied(
             break
 
     if all_ok:
-        print(f" all {len(source_files)} files already present — skipping copy.")
+        if not _tui:
+            print(f" all {len(source_files)} files already present — skipping copy.")
         for f in source_files:
             f["copy_status"] = "COMPLETED"
         return True
 
-    print(f" incomplete — will re-copy.")
+    if not _tui:
+        print(f" incomplete — will re-copy.")
     return False
 
 

@@ -80,6 +80,7 @@ def fetch_and_compare(
     dest_drive_id: str,
     dest_folder_id: str,
     token: str,
+    quiet: bool = False,
 ) -> list[dict]:
     """
     Enumerate the destination batch folder, match files against the source
@@ -88,7 +89,8 @@ def fetch_and_compare(
 
     Uses JSON batching ($batch) for HASH_PENDING retries to reduce roundtrips.
     """
-    print("  Verifying...", end="", flush=True)
+    if not quiet:
+        print("  Verifying...", end="", flush=True)
 
     # Enumerate dest recursively, keyed by relative path within the batch folder
     dest_files_raw = graph.enumerate_recursive(dest_drive_id, dest_folder_id, "", token)
@@ -145,10 +147,11 @@ def fetch_and_compare(
     total = len(source_files)
     ok_statuses = {"OK", "OK_SP_OVERHEAD", "OK_IMAGE_META"}
     issues = sum(1 for f in source_files if f.get("verify_status") not in ok_statuses)
-    if issues == 0:
-        print(f" ✓ All {total} files verified OK")
-    else:
-        print(f" ⚠  {issues}/{total} files have issues")
+    if not quiet:
+        if issues == 0:
+            print(f" ✓ All {total} files verified OK")
+        else:
+            print(f" ⚠  {issues}/{total} files have issues")
 
     return source_files
 
@@ -294,6 +297,7 @@ def compare_from_lookup(
     dest_lookup: dict[str, dict],
     dest_drive_id: str,
     token: str,
+    quiet: bool = False,
 ) -> list[dict]:
     """
     Compare source files against a pre-built {rel_path: dest_item} lookup.
@@ -302,7 +306,8 @@ def compare_from_lookup(
     rel_path key is the full source path (source['_path']), since dest_lookup
     is built relative to dest_root and source paths use the same convention.
     """
-    print("  Verifying...", end="", flush=True)
+    if not quiet:
+        print("  Verifying...", end="", flush=True)
 
     hash_pending: list[dict] = []
 
@@ -338,10 +343,11 @@ def compare_from_lookup(
     total = len(source_files)
     ok_statuses = {"OK", "OK_SP_OVERHEAD", "OK_IMAGE_META"}
     issues = sum(1 for f in source_files if f.get("verify_status") not in ok_statuses)
-    if issues == 0:
-        print(f" ✓ All {total} files verified OK")
-    else:
-        print(f" ⚠  {issues}/{total} files have issues")
+    if not quiet:
+        if issues == 0:
+            print(f" ✓ All {total} files verified OK")
+        else:
+            print(f" ⚠  {issues}/{total} files have issues")
 
     return source_files
 

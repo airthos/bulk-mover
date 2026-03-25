@@ -18,12 +18,13 @@ import verify
 
 load_dotenv()
 
-# Module-level settings (set by CLI args)
-_parallel_workers = 1
+# Module-level settings (set at runtime)
+_parallel_override: "int | None" = None  # None = auto-select from batch count
+_tui: "BatchTUI | None" = None
 
 
 def main() -> None:
-    global _parallel_workers
+    global _parallel_override
     parser = argparse.ArgumentParser(description="OneDrive → SharePoint Migration Tool")
     parser.add_argument(
         "--verify-only",
@@ -34,12 +35,13 @@ def main() -> None:
         "--parallel",
         type=int,
         metavar="N",
-        default=1,
-        help="Run N folder copies concurrently (default: 1, max: 4)",
+        default=None,
+        help="Override parallel worker count (default: auto, up to 6)",
     )
     args = parser.parse_args()
 
-    _parallel_workers = min(max(args.parallel, 1), 4)
+    if args.parallel is not None:
+        _parallel_override = min(max(args.parallel, 1), 6)
 
     print("\n=== OneDrive → SharePoint Migration Tool ===\n")
 
@@ -238,7 +240,9 @@ def _run_new_session(token: str, default_upn: str = "") -> None:
 
     _run_batches(batches, source_drive_id, dest_drive_id, dest_root_id,
                  source_folder_name, manifest, session_id, token,
-                 total_batches=len(batches))
+                 dest_library_name=dest_library_name,
+                 total_batches=len(batches),
+                 parallel_override=_parallel_override)
 
     report.mark_manifest_completed(manifest)
     report.save_manifest(manifest, source_folder_name, session_id)
@@ -291,8 +295,10 @@ def _run_resumed_session(manifest: dict, token: str) -> None:
 
     _run_batches(remaining, source_drive_id, dest_drive_id, dest_root_id,
                  source_folder_name, manifest, session_id, token,
+                 dest_library_name=manifest.get("dest_library", ""),
                  total_batches=len(manifest["batch_names"]) if manifest.get("batch_names") else len(batches),
-                 is_resuming=True)
+                 is_resuming=True,
+                 parallel_override=_parallel_override)
 
     report.mark_manifest_completed(manifest)
     manifest_path = report.save_manifest(manifest, source_folder_name, session_id)
@@ -311,157 +317,115 @@ def _run_batches(
     manifest: dict,
     session_id: str,
     token: str,
+    dest_library_name: str = "",
     total_batches: int = 0,
     is_resuming: bool = False,
+    parallel_override: int | None = None,
 ) -> None:
     """Execute the copy->verify->report loop for a list of batches."""
+    global _tui
     total = total_batches or len(batches)
-    if _parallel_workers > 1:
-        _run_batches_parallel(
-            batches, source_drive_id, dest_drive_id, dest_root_id,
-            source_folder_name, manifest, session_id, token,
-            total_batches=total, is_resuming=is_resuming,
-        )
-    else:
-        _run_batches_sequential(
-            batches, source_drive_id, dest_drive_id, dest_root_id,
-            source_folder_name, manifest, session_id, token,
-            total_batches=total, is_resuming=is_resuming,
-        )
 
-
-def _run_batches_sequential(
-    batches: list[dict],
-    source_drive_id: str,
-    dest_drive_id: str,
-    dest_root_id: str,
-    source_folder_name: str,
-    manifest: dict,
-    session_id: str,
-    token: str,
-    total_batches: int = 0,
-    is_resuming: bool = False,
-) -> None:
-    """Sequential batch execution (default)."""
-    total = total_batches or len(batches)
-    session_start = time.monotonic()
-    batch_times: list[float] = []
-
-    for b in batches:
-        _print_session_progress(b["number"], total, batch_times, session_start, is_resuming)
-
-        batch_start = time.monotonic()
-        files = _execute_single_batch(
-            b, source_drive_id, dest_drive_id, dest_root_id,
-            source_folder_name, manifest, session_id, token,
-        )
-        batch_times.append(time.monotonic() - batch_start)
-
-
-def _run_batches_parallel(
-    batches: list[dict],
-    source_drive_id: str,
-    dest_drive_id: str,
-    dest_root_id: str,
-    source_folder_name: str,
-    manifest: dict,
-    session_id: str,
-    token: str,
-    total_batches: int = 0,
-    is_resuming: bool = False,
-) -> None:
-    """Parallel batch execution using ThreadPoolExecutor."""
-    total = total_batches or len(batches)
-    manifest_lock = threading.Lock()
-    session_start = time.monotonic()
-    completed_count = 0
-    resume_tag = " [resuming]" if is_resuming else ""
-
-    print(f"  Running {len(batches)} batches with {_parallel_workers} workers{resume_tag}\n")
-
-    def _worker(b: dict) -> None:
-        nonlocal completed_count
-        _execute_single_batch(
-            b, source_drive_id, dest_drive_id, dest_root_id,
-            source_folder_name, manifest, session_id, token,
-            manifest_lock=manifest_lock,
-        )
-        completed_count += 1
-        elapsed = _fmt_duration(time.monotonic() - session_start)
-        remaining_count = len(batches) - completed_count
-        print(f"\n--- {completed_count}/{total} done — {elapsed} elapsed — {remaining_count} remaining ---")
-
-    # Root files batch must run alone (individual file copies, not parallelizable with folders)
     root_batches = [b for b in batches if b["is_root_files"]]
     folder_batches = [b for b in batches if not b["is_root_files"]]
 
-    # Run root files first (sequential)
-    for b in root_batches:
-        _worker(b)
-
-    # Run folder batches in parallel
-    with ThreadPoolExecutor(max_workers=_parallel_workers) as executor:
-        futures = {executor.submit(_worker, b): b for b in folder_batches}
-        for future in as_completed(futures):
-            exc = future.exception()
-            if exc:
-                b = futures[future]
-                print(f"\n  ERROR in batch {b['number']:02d} ({b['name']}): {exc}")
-
-
-def _execute_single_batch(
-    b: dict,
-    source_drive_id: str,
-    dest_drive_id: str,
-    dest_root_id: str,
-    source_folder_name: str,
-    manifest: dict,
-    session_id: str,
-    token: str,
-    manifest_lock: "threading.Lock | None" = None,
-) -> list[dict]:
-    """Run copy + verify + report for a single batch. Thread-safe if manifest_lock provided."""
-    files = batch_mod.run_batch(
-        batch=b,
-        source_drive_id=source_drive_id,
-        dest_drive_id=dest_drive_id,
-        dest_root_id=dest_root_id,
-        token=token,
-    )
-
-    if not files:
-        return []
-
-    if b["is_root_files"]:
-        _verify_root_files(files, dest_drive_id, token)
+    # Auto-select worker count (1 per folder batch, capped at 6); --parallel overrides
+    if parallel_override is not None:
+        n_workers = parallel_override
     else:
-        dest_batch_folder = _find_dest_folder(
-            dest_drive_id, dest_root_id, b["name"], token
-        )
-        if dest_batch_folder:
-            files = verify.fetch_and_compare(
-                files, dest_drive_id, dest_batch_folder["id"], token
+        n_workers = min(max(len(folder_batches), 1), 6)
+    n_workers = max(n_workers, 1)
+
+    manifest_lock = threading.Lock()
+
+    from tui import BatchTUI
+    initial_completed = total - len(batches)  # already-done batches on a resume
+    tui = BatchTUI(
+        source=source_folder_name,
+        dest=dest_library_name or "SharePoint",
+        total_batches=total,
+        n_workers=n_workers,
+        initial_completed=max(initial_completed, 0),
+    )
+    _tui = tui
+    batch_mod.set_tui(tui)
+
+    # copy_results holds (batch, files) for Phase 2 verification
+    copy_results: list[tuple[dict, list[dict]]] = []
+    copy_lock = threading.Lock()
+
+    with tui:
+        # ------------------------------------------------------------------
+        # Phase 1: Copy all batches (parallel)
+        # ------------------------------------------------------------------
+        def _copy_worker(b: dict) -> None:
+            files = batch_mod.run_batch(
+                batch=b,
+                source_drive_id=source_drive_id,
+                dest_drive_id=dest_drive_id,
+                dest_root_id=dest_root_id,
+                token=token,
             )
-        else:
-            print(f"  Warning: dest folder '{b['name']}' not found — marking all MISSING")
-            for f in files:
-                f["verify_status"] = "MISSING"
-                f["verify_notes"] = "Dest folder not found after copy"
+            with copy_lock:
+                copy_results.append((b, files))
+            if tui:
+                if files:
+                    tui.update(b["name"], "copied", file_count=len(files))
+                else:
+                    tui.complete(b["name"], ok_count=0, issue_count=0)
 
-    csv_path = report.write_batch_csv(
-        source_folder_name, b["number"], b["name"], files, session_id
-    )
-    print(f"  CSV written: {csv_path}")
+        for b in root_batches:
+            _copy_worker(b)
 
-    if manifest_lock:
-        with manifest_lock:
-            report.add_batch_to_manifest(manifest, b["name"], b["number"], files)
-            report.save_manifest(manifest, source_folder_name, session_id)
-    else:
-        report.add_batch_to_manifest(manifest, b["name"], b["number"], files)
-        report.save_manifest(manifest, source_folder_name, session_id)
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {executor.submit(_copy_worker, b): b for b in folder_batches}
+            for future in as_completed(futures):
+                exc = future.exception()
+                if exc:
+                    b = futures[future]
+                    tui._plain(f"ERROR copying batch {b['number']:02d} ({b['name']}): {exc}")
 
-    return files
+        # ------------------------------------------------------------------
+        # Phase 2: Verify all batches (sequential, after all copies done)
+        # SP has had time to process files during Phase 1.
+        # ------------------------------------------------------------------
+        for b, files in copy_results:
+            if not files:
+                continue  # empty batch — already completed above
+
+            if tui:
+                tui.update(b["name"], "verifying", file_count=len(files))
+
+            if b["is_root_files"]:
+                _verify_root_files(files, dest_drive_id, token)
+            else:
+                dest_batch_folder = _find_dest_folder(
+                    dest_drive_id, dest_root_id, b["name"], token
+                )
+                if dest_batch_folder:
+                    files = verify.fetch_and_compare(
+                        files, dest_drive_id, dest_batch_folder["id"], token,
+                        quiet=True,
+                    )
+                else:
+                    for f in files:
+                        f["verify_status"] = "MISSING"
+                        f["verify_notes"] = "Dest folder not found after copy"
+
+            report.write_batch_csv(
+                source_folder_name, b["number"], b["name"], files, session_id
+            )
+
+            with manifest_lock:
+                report.add_batch_to_manifest(manifest, b["name"], b["number"], files)
+                report.save_manifest(manifest, source_folder_name, session_id)
+
+            if tui:
+                ok_count = sum(1 for f in files if f.get("verify_status") in _OK_STATUSES)
+                tui.complete(b["name"], ok_count=ok_count, issue_count=len(files) - ok_count)
+
+    batch_mod.set_tui(None)
+    _tui = None
 
 
 # ---------------------------------------------------------------------------
@@ -475,27 +439,6 @@ def _fmt_duration(seconds: float) -> str:
         return f"{h}h{m:02d}m"
     return f"{m}m{s:02d}s"
 
-
-def _print_session_progress(
-    batch_num: int,
-    total_batches: int,
-    batch_times: list[float],
-    session_start: float,
-    is_resuming: bool = False,
-) -> None:
-    """Print session-level progress: batch N/total, elapsed, estimated remaining."""
-    elapsed = time.monotonic() - session_start
-    elapsed_str = _fmt_duration(elapsed)
-
-    if batch_times:
-        avg_time = sum(batch_times) / len(batch_times)
-        remaining_batches = total_batches - batch_num
-        remaining_str = f" — ~{_fmt_duration(avg_time * remaining_batches)} remaining"
-    else:
-        remaining_str = ""
-
-    resume_tag = " [resuming]" if is_resuming else ""
-    print(f"\n--- Batch {batch_num}/{total_batches}{resume_tag} — {elapsed_str} elapsed{remaining_str} ---")
 
 
 def _parse_root_items(top_level: list[dict]) -> list[dict]:

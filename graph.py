@@ -157,21 +157,30 @@ def enumerate_recursive(
     folder_id: str,
     base_path: str,
     token: str,
+    progress_callback=None,
 ) -> list[dict]:
     """
     Recursively enumerate all files under folder_id.
     Returns a flat list of file driveItems, each with a '_path' key
     set to its path relative to the selected root folder.
+
+    progress_callback(n: int) is called after each subfolder is fully
+    enumerated, with the running total of files found so far.
     """
-    result = []
-    children = list_children(drive_id, folder_id, token, select=SOURCE_SELECT)
-    for item in children:
-        item_path = f"{base_path}/{item['name']}" if base_path else item["name"]
-        if "folder" in item:
-            result.extend(enumerate_recursive(drive_id, item["id"], item_path, token))
-        else:
-            item["_path"] = item_path
-            result.append(item)
+    result: list[dict] = []
+
+    def _recurse(fid: str, path: str) -> None:
+        for item in list_children(drive_id, fid, token, select=SOURCE_SELECT):
+            item_path = f"{path}/{item['name']}" if path else item["name"]
+            if "folder" in item:
+                _recurse(item["id"], item_path)
+            else:
+                item["_path"] = item_path
+                result.append(item)
+        if progress_callback:
+            progress_callback(len(result))
+
+    _recurse(folder_id, base_path)
     return result
 
 

@@ -3,3 +3,4 @@ requests
 inquirer
 tqdm
 python-dotenv
+rich
