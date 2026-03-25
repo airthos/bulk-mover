@@ -109,7 +109,11 @@ def _pick_source(
     source_folder_name, upn).
     """
     print(f"{step_prefix}Pick source (OneDrive)")
-    upn = prompts.prompt_source_upn(default=default_upn)
+    if default_upn:
+        upn = default_upn
+        print(f"  Using signed-in account: {upn}")
+    else:
+        upn = prompts.prompt_source_upn()
 
     print("  Fetching drive...", end="", flush=True)
     drive = graph.get_user_drive(upn, token)
@@ -121,43 +125,48 @@ def _pick_source(
     own_folders = _parse_root_items(top_level)
     print(f" done ({len(own_folders)} folders)")
 
-    source_folder_item = prompts.prompt_source_folder(own_folders)
+    while True:
+        source_folder_item = prompts.prompt_source_folder(own_folders)
 
-    if source_folder_item.get("_use_root"):
-        source_folder_id = "root"
-        source_folder_name = drive.get("name", "root")
-    elif "_search_query" in source_folder_item:
-        query = source_folder_item["_search_query"]
-        print(f"  Searching for '{query}'...", end="", flush=True)
-        results = graph.search_drive_folders(source_drive_id, query, token)
-        print(f" {len(results)} folder(s) found")
-        if not results:
-            print("  No folders found. Try a different name or use [Enter custom path].")
-            sys.exit(1)
-        source_folder_item = prompts.prompt_search_result(results)
-        source_folder_id = source_folder_item["id"]
-        source_folder_name = source_folder_item["name"]
-    elif "_custom_path" in source_folder_item:
-        print("  Resolving path...", end="", flush=True)
-        resolved = graph.get_item_by_path(
-            source_drive_id, "/" + source_folder_item["_custom_path"], token
-        )
-        print(" done")
-        if "remoteItem" in resolved:
-            remote = resolved["remoteItem"]
-            source_folder_item = {
-                "id": remote["id"],
-                "name": resolved["name"],
-                "_drive_id": remote.get("parentReference", {}).get("driveId"),
-                "_shared": True,
-            }
+        if source_folder_item.get("_use_root"):
+            source_folder_id = "root"
+            source_folder_name = drive.get("name", "root")
+            break
+        elif "_search_query" in source_folder_item:
+            query = source_folder_item["_search_query"]
+            print(f"  Searching for '{query}'...", end="", flush=True)
+            results = graph.search_drive_folders(source_drive_id, query, token)
+            print(f" {len(results)} folder(s) found")
+            if not results:
+                print("  No folders found — returning to folder list.")
+                continue
+            source_folder_item = prompts.prompt_search_result(results)
+            source_folder_id = source_folder_item["id"]
+            source_folder_name = source_folder_item["name"]
+            break
+        elif "_custom_path" in source_folder_item:
+            print("  Resolving path...", end="", flush=True)
+            resolved = graph.get_item_by_path(
+                source_drive_id, "/" + source_folder_item["_custom_path"], token
+            )
+            print(" done")
+            if "remoteItem" in resolved:
+                remote = resolved["remoteItem"]
+                source_folder_item = {
+                    "id": remote["id"],
+                    "name": resolved["name"],
+                    "_drive_id": remote.get("parentReference", {}).get("driveId"),
+                    "_shared": True,
+                }
+            else:
+                source_folder_item = resolved
+            source_folder_id = source_folder_item["id"]
+            source_folder_name = source_folder_item["name"]
+            break
         else:
-            source_folder_item = resolved
-        source_folder_id = source_folder_item["id"]
-        source_folder_name = source_folder_item["name"]
-    else:
-        source_folder_id = source_folder_item["id"]
-        source_folder_name = source_folder_item["name"]
+            source_folder_id = source_folder_item["id"]
+            source_folder_name = source_folder_item["name"]
+            break
 
     if source_folder_item.get("_drive_id"):
         source_drive_id = source_folder_item["_drive_id"]
