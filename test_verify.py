@@ -44,12 +44,12 @@ class TestCompareFileOK:
         assert status == "OK"
         assert notes == ""
 
-    def test_no_source_hash_still_ok(self):
-        """If source hash is missing (not yet computed), result should be OK."""
+    def test_no_source_hash_returns_unavailable(self):
+        """If source hash is missing, result should be HASH_UNAVAILABLE (size-only check)."""
         src = _file("report.pdf", 1000, "")
         dst = _file("report.pdf", 1000, "abc123")
         status, _ = compare_file(src, dst)
-        assert status == "OK"
+        assert status == "HASH_UNAVAILABLE"
 
 
 class TestCompareFileOfficeSPOverhead:
