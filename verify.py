@@ -205,6 +205,32 @@ def _retry_hash_pending_batched(
 
 
 # ---------------------------------------------------------------------------
+# Destination-only detection
+# ---------------------------------------------------------------------------
+
+def find_dest_only(
+    source_files: list[dict],
+    dest_lookup: dict[str, dict],
+) -> list[dict]:
+    """
+    Return dest items that have no corresponding source file — files that exist
+    at the destination but were never part of the migration source manifest.
+    This catches files created or modified directly on SharePoint after the copy.
+
+    Each returned dict is the dest driveItem with an added '_dest_path' key
+    containing its path relative to the destination root.
+    """
+    matched = {f.get("_path", "").lstrip("/") for f in source_files}
+    result = []
+    for dest_path, item in dest_lookup.items():
+        if dest_path not in matched:
+            entry = dict(item)
+            entry["_dest_path"] = dest_path
+            result.append(entry)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Delta-based re-verification
 # ---------------------------------------------------------------------------
 

@@ -150,6 +150,35 @@ def write_batch_csv(
     return filename
 
 
+_DEST_ONLY_FIELDS = ["dest_path", "size", "verify_status", "notes"]
+
+
+def write_dest_only_csv(dest_only_items: list[dict], run_dir: Path) -> Path:
+    """
+    Write a CSV of destination-only files (DEST_ONLY status) — files present at
+    the destination but not in the source manifest. Written once per verify run.
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    filename = run_dir / "dest-only.csv"
+    with open(filename, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_DEST_ONLY_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for item in dest_only_items:
+            writer.writerow({
+                "dest_path": item.get("_dest_path", ""),
+                "size": item.get("size", ""),
+                "verify_status": "DEST_ONLY",
+                "notes": "File exists at destination but not in source manifest",
+            })
+        writer.writerow({
+            "dest_path": f"SUMMARY: total={len(dest_only_items)}",
+            "size": "",
+            "verify_status": "",
+            "notes": "",
+        })
+    return filename
+
+
 # ---------------------------------------------------------------------------
 # Session manifest
 # ---------------------------------------------------------------------------

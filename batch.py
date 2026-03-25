@@ -156,7 +156,8 @@ def _copy_folder(
     batch_name = batch["name"]
 
     # --- Verify-then-skip: if dest folder already exists with matching content, skip copy ---
-    if _verify_already_copied(batch_name, source_files, dest_drive_id, dest_root_id, token):
+    skipped, dest_exists = _verify_already_copied(batch_name, source_files, dest_drive_id, dest_root_id, token)
+    if skipped:
         return
 
     # Check for a saved pending job from a previous run
@@ -170,8 +171,10 @@ def _copy_folder(
         if not _tui:
             print(f"  Copying {len(source_files)} files...", end="", flush=True)
         try:
+            conflict = "replace" if dest_exists else None
             location = graph.copy_item(
-                source_drive_id, batch["item_id"], dest_drive_id, dest_root_id, token
+                source_drive_id, batch["item_id"], dest_drive_id, dest_root_id, token,
+                conflict_behavior=conflict,
             )
             # Save immediately so a kill mid-poll doesn't lose the URL
             _save_pending_job(batch_name, location)
@@ -258,11 +261,15 @@ def _verify_already_copied(
     dest_drive_id: str,
     dest_root_id: str,
     token: str,
-) -> bool:
+) -> tuple[bool, bool]:
     """
     Check if the batch folder already exists at the destination with all files
-    matching. If so, mark all source files as COMPLETED and return True.
-    This prevents re-copying on re-runs of timed-out or interrupted batches.
+    matching. If so, mark all source files as COMPLETED.
+
+    Returns (skipped, dest_exists):
+      (True,  True)  — dest folder complete; copy skipped
+      (False, True)  — dest folder exists but incomplete; caller should re-copy with conflict_behavior="replace"
+      (False, False) — dest folder absent; fresh copy
     """
     # Find the dest folder by name
     children = graph.list_children(
@@ -273,7 +280,7 @@ def _verify_already_copied(
         None,
     )
     if not dest_folder:
-        return False
+        return False, False
 
     # Enumerate dest and compare
     if not _tui:
@@ -306,11 +313,11 @@ def _verify_already_copied(
             print(f" all {len(source_files)} files already present — skipping copy.")
         for f in source_files:
             f["copy_status"] = "COMPLETED"
-        return True
+        return True, True
 
     if not _tui:
         print(f" incomplete — will re-copy.")
-    return False
+    return False, True
 
 
 def _mark_all(files: list[dict], status: str, notes: str) -> None:

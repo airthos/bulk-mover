@@ -538,6 +538,7 @@ def _verify_session(manifest: dict, token: str) -> None:
 
     total_issues = 0
     total_files = 0
+    all_source_dicts: list[dict] = []
 
     for batch_entry in manifest.get("batches", []):
         batch_name = batch_entry.get("batch_name", "")
@@ -552,6 +553,7 @@ def _verify_session(manifest: dict, token: str) -> None:
         source_dicts = verify.compare_from_lookup(
             source_dicts, dest_lookup, dest_drive_id, token
         )
+        all_source_dicts.extend(source_dicts)
 
         csv_path = report.write_batch_csv(
             source_folder_name, batch_num, batch_name, source_dicts, run_dir=run_dir
@@ -561,6 +563,14 @@ def _verify_session(manifest: dict, token: str) -> None:
         batch_issues = sum(1 for f in source_dicts if f.get("verify_status") not in _OK_STATUSES)
         total_issues += batch_issues
         total_files += len(source_dicts)
+
+    dest_only = verify.find_dest_only(all_source_dicts, dest_lookup)
+    if dest_only:
+        dest_only_csv = report.write_dest_only_csv(dest_only, run_dir)
+        print(f"\n  ⚠  {len(dest_only)} file(s) at destination not in source manifest")
+        print(f"  DEST_ONLY CSV: {dest_only_csv}")
+    else:
+        print(f"\n  ✓ No destination-only files")
 
     print(f"\n=== Verification complete — {total_files} files, {total_issues} issues ===")
     print(f"Results: {run_dir}\n")
@@ -626,6 +636,14 @@ def _verify_adhoc(token: str, default_upn: str = "") -> None:
         print(f"  CSV written: {csv_path}")
         total_issues += sum(1 for f in verified if f.get("verify_status") not in _OK_STATUSES)
         total_files += len(verified)
+
+    dest_only = verify.find_dest_only(source_files, dest_lookup)
+    if dest_only:
+        dest_only_csv = report.write_dest_only_csv(dest_only, run_dir)
+        print(f"\n  ⚠  {len(dest_only)} file(s) at destination not in source")
+        print(f"  DEST_ONLY CSV: {dest_only_csv}")
+    else:
+        print(f"\n  ✓ No destination-only files")
 
     print(f"\n=== Verification complete — {total_files} files, {total_issues} issues ===")
     print(f"Results: {run_dir}\n")
