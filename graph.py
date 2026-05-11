@@ -1,4 +1,6 @@
+import base64
 import time
+from urllib.parse import urlparse, unquote
 from typing import Callable, Generator, Optional
 
 import requests
@@ -7,10 +9,10 @@ from urllib3.util.retry import Retry
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# Fields captured from source files for the manifest and verification
+# Fields captured from source files for copy decisions and reports.
 SOURCE_SELECT = (
     "id,name,size,file,folder,fileSystemInfo,createdBy,lastModifiedBy,"
-    "createdDateTime,lastModifiedDateTime,sharepointIds,parentReference"
+    "createdDateTime,lastModifiedDateTime,sharepointIds,parentReference,remoteItem"
 )
 
 
@@ -27,24 +29,24 @@ _retry = Retry(
 )
 _adapter = HTTPAdapter(
     max_retries=_retry,
-    pool_connections=1,   # single host: graph.microsoft.com
+    pool_connections=1,
     pool_maxsize=4,
 )
 
 _session = requests.Session()
 _session.mount("https://", _adapter)
 _session.headers.update({
-    "User-Agent": "NONISV|Airtho|BulkMover/1.0",
+    "User-Agent": "BulkMover/1.0",
 })
 
 # Separate session for anonymous poll URLs (no auth, still needs retry)
 _poll_session = requests.Session()
 _poll_session.mount("https://", _adapter)
 _poll_session.headers.update({
-    "User-Agent": "NONISV|Airtho|BulkMover/1.0",
+    "User-Agent": "BulkMover/1.0",
 })
 
-# Optional token refresher — set once at startup via register_token_refresher()
+# Optional token refresher set once at startup.
 _token_refresher: Optional[Callable[[], str]] = None
 
 
@@ -99,7 +101,7 @@ def _paginate(url: str, token: str, params: Optional[dict] = None) -> Generator[
         data = resp.json()
         yield from data.get("value", [])
         url = data.get("@odata.nextLink")
-        params = None  # nextLink already contains query params
+        params = None
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +120,32 @@ def get_site(hostname: str, site_path: str, token: str) -> dict:
 
 def list_site_drives(site_id: str, token: str) -> list[dict]:
     return list(_paginate(f"{GRAPH_BASE}/sites/{site_id}/drives", token))
+
+
+def get_me_drive(token: str) -> dict:
+    return _request("GET", f"{GRAPH_BASE}/me/drive", token).json()
+
+
+def list_followed_sites(token: str) -> list[dict]:
+    return list(_paginate(f"{GRAPH_BASE}/me/followedSites", token))
+
+
+def get_site_from_url(site_url: str, token: str) -> dict:
+    parsed = urlparse(site_url.strip())
+    if not parsed.netloc:
+        raise ValueError("SharePoint site URL must include a hostname.")
+
+    path = unquote(parsed.path.rstrip("/"))
+    marker = "/sites/"
+    if marker in path:
+        site_path = path[: path.find(marker) + len(marker)]
+        site_name = path[path.find(marker) + len(marker):].split("/", 1)[0]
+        path = f"{site_path}{site_name}"
+    elif path:
+        parts = [part for part in path.split("/") if part]
+        path = "/" + "/".join(parts[:2]) if parts else ""
+
+    return get_site(parsed.netloc, path, token)
 
 
 # ---------------------------------------------------------------------------
@@ -152,36 +180,94 @@ def get_item_by_path(drive_id: str, path: str, token: str) -> dict:
     return _request("GET", url, token).json()
 
 
-def enumerate_recursive(
+def get_drive_item_from_url(item_url: str, token: str) -> dict:
+    encoded = base64.urlsafe_b64encode(item_url.strip().encode("utf-8")).decode("ascii")
+    share_id = "u!" + encoded.rstrip("=")
+    url = f"{GRAPH_BASE}/shares/{share_id}/driveItem"
+    return _request("GET", url, token).json()
+
+
+def list_source_roots(token: str) -> list[dict]:
+    drive = get_me_drive(token)
+    children = list_children(drive["id"], "root", token, select=SOURCE_SELECT)
+    roots = [{
+        "label": "[My OneDrive root]",
+        "name": drive.get("name", "My OneDrive"),
+        "drive_id": drive["id"],
+        "item_id": "root",
+        "is_folder": True,
+    }]
+    for item in children:
+        if "folder" in item:
+            roots.append({
+                "label": item["name"],
+                "name": item["name"],
+                "drive_id": drive["id"],
+                "item_id": item["id"],
+                "is_folder": True,
+            })
+            continue
+        remote = item.get("remoteItem")
+        if not remote or "file" in remote:
+            continue
+        remote_drive_id = (remote.get("parentReference") or {}).get("driveId")
+        if not remote_drive_id:
+            continue
+        roots.append({
+            "label": f"{item['name']} (shortcut/shared)",
+            "name": item["name"],
+            "drive_id": remote_drive_id,
+            "item_id": remote["id"],
+            "is_folder": True,
+        })
+    return roots
+
+
+def get_or_create_folder(
     drive_id: str,
-    folder_id: str,
-    base_path: str,
+    parent_id: str,
+    name: str,
     token: str,
-    progress_callback=None,
-) -> list[dict]:
+) -> str:
     """
-    Recursively enumerate all files under folder_id.
-    Returns a flat list of file driveItems, each with a '_path' key
-    set to its path relative to the selected root folder.
-
-    progress_callback(n: int) is called after each subfolder is fully
-    enumerated, with the running total of files found so far.
+    Get or create a folder by name directly under parent_id.
+    Returns the folder item ID.
     """
-    result: list[dict] = []
+    children = list_children(drive_id, parent_id, token, select="id,name,folder")
+    existing = next((c for c in children if _same_name(c.get("name", ""), name) and "folder" in c), None)
+    if existing:
+        return existing["id"]
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{parent_id}/children"
+    body = {"name": name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}
+    try:
+        resp = _request("POST", url, token, json=body)
+        return resp.json()["id"]
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 409:
+            raise
+        children = list_children(drive_id, parent_id, token, select="id,name,folder")
+        existing = next((c for c in children if _same_name(c.get("name", ""), name) and "folder" in c), None)
+        if existing:
+            return existing["id"]
+        raise
 
-    def _recurse(fid: str, path: str) -> None:
-        for item in list_children(drive_id, fid, token, select=SOURCE_SELECT):
-            item_path = f"{path}/{item['name']}" if path else item["name"]
-            if "folder" in item:
-                _recurse(item["id"], item_path)
-            else:
-                item["_path"] = item_path
-                result.append(item)
-        if progress_callback:
-            progress_callback(len(result))
 
-    _recurse(folder_id, base_path)
-    return result
+def _same_name(left: str, right: str) -> bool:
+    return left.casefold() == right.casefold()
+
+
+def move_item(
+    drive_id: str,
+    item_id: str,
+    new_parent_id: str,
+    token: str,
+    new_name: str | None = None,
+) -> dict:
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}"
+    body = {"parentReference": {"id": new_parent_id}}
+    if new_name:
+        body["name"] = new_name
+    return _request("PATCH", url, token, json=body).json()
 
 
 # ---------------------------------------------------------------------------
@@ -209,9 +295,10 @@ def copy_item(
             "id": dest_folder_id,
         }
     }
+    params = None
     if conflict_behavior:
-        body["@microsoft.graph.conflictBehavior"] = conflict_behavior
-    resp = _request("POST", url, token, json=body)
+        params = {"@microsoft.graph.conflictBehavior": conflict_behavior}
+    resp = _request("POST", url, token, json=body, params=params)
     location = resp.headers.get("Location")
     if not location:
         raise RuntimeError("Copy accepted but no Location header returned")
@@ -225,7 +312,7 @@ def poll_copy_job(
 ) -> dict:
     """
     Poll a copy job monitor URL until completed, failed, or timed out.
-    The Location URL is anonymous — no auth header required.
+    The Location URL is anonymous. No auth header required.
 
     Uses exponential backoff: starts at 5s, grows by 1.5x, caps at 60s.
     timeout_seconds=None means poll indefinitely.
@@ -243,7 +330,6 @@ def poll_copy_job(
         try:
             resp = _poll_session.get(location, timeout=30)
         except requests.RequestException:
-            # Transport error — back off and retry
             time.sleep(min(interval, 60))
             interval = min(interval * 1.5, 60)
             continue
@@ -263,83 +349,10 @@ def poll_copy_job(
         interval = min(interval * 1.5, 60)
 
 
-# ---------------------------------------------------------------------------
-# JSON batching (verification phase)
-# ---------------------------------------------------------------------------
-
-def batch_get_items(requests_list: list[dict], token: str) -> list[dict]:
-    """
-    Execute JSON batch GETs (up to 20 per call).
-    requests_list: [{ "id": str, "method": "GET", "url": str }, ...]
-
-    Handles per-item 429s by retrying after the longest retry-after seen.
-    Returns responses in the same order as the input list.
-    """
-    url = "https://graph.microsoft.com/v1.0/$batch"
-    results: dict[str, dict] = {}
-
-    chunks = [requests_list[i : i + 20] for i in range(0, len(requests_list), 20)]
-
-    for chunk in chunks:
-        pending = {req["id"]: req for req in chunk}
-
-        while pending:
-            resp = _request("POST", url, token, json={"requests": list(pending.values())})
-            responses = resp.json().get("responses", [])
-
-            retry_after = 0
-            still_pending: dict[str, dict] = {}
-
-            for r in responses:
-                if r["status"] == 429:
-                    ra = int(r.get("headers", {}).get("retry-after", 5))
-                    retry_after = max(retry_after, ra)
-                    still_pending[r["id"]] = pending[r["id"]]
-                else:
-                    results[r["id"]] = r
-
-            if still_pending:
-                time.sleep(retry_after)
-                pending = still_pending
-            else:
-                break
-
-    return [results[req["id"]] for req in requests_list if req["id"] in results]
-
-
-# ---------------------------------------------------------------------------
-# SharePoint metadata
-# ---------------------------------------------------------------------------
-
-def search_drive_folders(drive_id: str, query: str, token: str) -> list[dict]:
-    """
-    Search a drive for folders matching query. Returns normalised folder dicts.
-    Includes mount-point shortcuts (remoteItem) which are invisible to /children.
-
-    Only fetches the first page — search results can span thousands of pages and
-    mount-point shortcuts appear in results when the query matches their name.
-    """
-    url = f"{GRAPH_BASE}/drives/{drive_id}/root/search(q='{query}')"
-    resp = _request("GET", url, token, params={"$top": 50})
-    items = resp.json().get("value", [])
-    folders = []
-    for item in items:
-        if "remoteItem" in item:
-            remote = item["remoteItem"]
-            if "file" in remote or "file" in item:
-                continue
-            folders.append({
-                "id": remote["id"],
-                "name": item["name"],
-                "folder": remote.get("folder") or item.get("folder", {}),
-                "_drive_id": remote.get("parentReference", {}).get("driveId"),
-                "_shared": True,
-            })
-        elif "folder" in item:
-            folders.append(item)
-    return folders
-
-
+def get_copy_job_status(location: str) -> dict:
+    resp = _poll_session.get(location, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
 
 # ---------------------------------------------------------------------------
 # Delta queries
@@ -374,7 +387,7 @@ def get_drive_delta(
         data = resp.json()
         items.extend(data.get("value", []))
         url = data.get("@odata.nextLink")
-        params = None  # nextLink has params baked in
+        params = None
         if "@odata.deltaLink" in data:
             new_delta_link = data["@odata.deltaLink"]
 
@@ -385,65 +398,29 @@ def get_folder_delta(
     drive_id: str,
     folder_id: str,
     token: str,
-    delta_link: str | None = None,
     select: str | None = None,
+    progress_callback=None,
 ) -> tuple[list[dict], str]:
-    """
-    Enumerate all descendants of a specific folder using delta query.
-    More efficient than recursive /children for deep trees (10–50 calls vs 500–5000+).
-
-    If delta_link is provided, fetches only changes since that token (incremental).
-    Returns (items, new_delta_link) where items is a flat list of all descendants.
-
-    Handles 410 Gone (stale delta token) by falling back to full enumeration.
-    """
-    import requests as _req
-
-    _original_delta_link = delta_link  # for 410 detection — only fallback once
-
-    if delta_link:
-        url = delta_link
-        params = None
+    if folder_id == "root":
+        url = f"{GRAPH_BASE}/drives/{drive_id}/root/delta"
     else:
         url = f"{GRAPH_BASE}/drives/{drive_id}/items/{folder_id}/delta"
-        params = {"$select": select} if select else None
-
+    params = {"$select": select} if select else None
     items: list[dict] = []
-    new_delta_link = ""
+    delta_link = ""
+    pages = 0
 
     while url:
-        try:
-            resp = _request("GET", url, token, params=params)
-        except _req.HTTPError as exc:
-            if (
-                _original_delta_link
-                and exc.response is not None
-                and exc.response.status_code == 410
-            ):
-                # Stale delta token — restart with a full enumeration
-                _original_delta_link = None
-                url = f"{GRAPH_BASE}/drives/{drive_id}/items/{folder_id}/delta"
-                params = {"$select": select} if select else None
-                items = []
-                new_delta_link = ""
-                continue
-            raise
+        resp = _request("GET", url, token, params=params)
         data = resp.json()
-        items.extend(data.get("value", []))
+        page_items = data.get("value", [])
+        items.extend(page_items)
+        pages += 1
+        if progress_callback:
+            progress_callback(pages, len(items))
         url = data.get("@odata.nextLink")
-        params = None  # nextLink has params baked in
+        params = None
         if "@odata.deltaLink" in data:
-            new_delta_link = data["@odata.deltaLink"]
+            delta_link = data["@odata.deltaLink"]
 
-    return items, new_delta_link
-
-
-def patch_list_item_fields(
-    site_id: str,
-    list_id: str,
-    list_item_id: str,
-    fields: dict,
-    token: str,
-) -> dict:
-    url = f"{GRAPH_BASE}/sites/{site_id}/lists/{list_id}/items/{list_item_id}/fields"
-    return _request("PATCH", url, token, json=fields).json()
+    return items, delta_link

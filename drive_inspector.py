@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-drive_inspector.py — standalone Graph API drive stats tool
+drive_inspector.py - standalone Graph API drive stats tool
 
 Usage:
     python drive_inspector.py
-    python drive_inspector.py --site "airtho.sharepoint.com/sites/Airtho"
+    python drive_inspector.py --site "contoso.sharepoint.com/sites/Team"
     python drive_inspector.py --drive-id <id>
     python drive_inspector.py --no-tenant          # skip tenant-wide section
 
@@ -23,13 +23,13 @@ GRAPH = GRAPH_BASE
 TENANT_EXTS = [".pdf", ".docx", ".xlsx", ".dwg", ".msg", ".png", ".jpg"]
 
 
-# ── Graph helpers ─────────────────────────────────────────────────────────────
+# -- Graph helpers -------------------------------------------------------------
 
 def _get(token: str, url: str, **params) -> dict:
     return _request("GET", url, token, params=params or None).json()
 
 
-# ── Site / drive selection ─────────────────────────────────────────────────────
+# -- Site / drive selection -----------------------------------------------------
 
 def resolve_site_and_drive(
     token: str, site_arg: str | None, drive_id_arg: str | None
@@ -45,10 +45,10 @@ def resolve_site_and_drive(
 
     if not site_arg:
         site_arg = input(
-            "Enter SharePoint site [airtho.sharepoint.com/sites/Airtho]: "
-        ).strip().lstrip("https://").lstrip("http://") or "airtho.sharepoint.com/sites/Airtho"
+            "Enter SharePoint site [contoso.sharepoint.com/sites/Team]: "
+        ).strip().lstrip("https://").lstrip("http://") or "contoso.sharepoint.com/sites/Team"
 
-    # Split hostname and /path — same convention as bulk-mover
+    # Split hostname and /path - same convention as bulk-mover
     if "/" in site_arg:
         hostname, site_path = site_arg.split("/", 1)
         site_path = "/" + site_path
@@ -77,7 +77,7 @@ def resolve_site_and_drive(
     return selected["id"], selected["name"], drives
 
 
-# ── Formatting ────────────────────────────────────────────────────────────────
+# -- Formatting ----------------------------------------------------------------
 
 def fmt_bytes(n: int | None) -> str:
     if n is None:
@@ -95,7 +95,7 @@ def section(title: str) -> None:
     print("=" * 60)
 
 
-# ── Per-drive queries ─────────────────────────────────────────────────────────
+# -- Per-drive queries ---------------------------------------------------------
 
 def drive_quota(token: str, drive_id: str) -> None:
     section("DRIVE QUOTA")
@@ -112,7 +112,7 @@ def drive_quota(token: str, drive_id: str) -> None:
 
 
 def file_sample(token: str, drive_id: str, top: int = 10) -> None:
-    section(f"FILE SAMPLE — root children (up to {top})")
+    section(f"FILE SAMPLE - root children (up to {top})")
     data = _get(
         token,
         f"{GRAPH}/drives/{drive_id}/root/children",
@@ -145,7 +145,7 @@ def modified_last_n_days(token: str, drive_id: str, days: int = 30) -> None:
 
 def ext_count(token: str, ext: str) -> None:
     """Tenant-wide file type count via POST /search/query (KQL filetype:).
-    Note: contentSources is not supported for driveItem — result is tenant-wide.
+    Note: contentSources is not supported for driveItem - result is tenant-wide.
     """
     section(f"{ext.upper()} FILE COUNT  (tenant-wide)")
     filetype = ext.lstrip(".")
@@ -163,7 +163,7 @@ def ext_count(token: str, ext: str) -> None:
     print(f"  Count: {total}")
 
 
-# ── Tenant-wide stats ─────────────────────────────────────────────────────────
+# -- Tenant-wide stats ---------------------------------------------------------
 
 def _scan_drive(drive: dict, token: str) -> dict:
     """Delta-scan one drive; return item count and per-extension counts."""
@@ -183,7 +183,7 @@ def _scan_drive(drive: dict, token: str) -> dict:
 def tenant_wide_stats(token: str, drives: list[dict]) -> None:
     section(f"TENANT-WIDE STATS  ({len(drives)} drives on this site)")
 
-    # Storage — SharePoint drives share a site collection quota pool,
+    # Storage - SharePoint drives share a site collection quota pool,
     # so all drives report the same numbers. Show once, not summed.
     quota_data = _get(token, f"{GRAPH}/drives/{drives[0]['id']}")
     quota = quota_data.get("quota", {})
@@ -217,16 +217,16 @@ def tenant_wide_stats(token: str, drives: list[dict]) -> None:
         for e in TENANT_EXTS:
             totals_ext[e] += r["ext_counts"][e]
 
-    print(f"  {'─'*22} {'─'*7}  " + "  ".join(f"{'─'*5}" for _ in TENANT_EXTS))
+    print(f"  {'-'*22} {'-'*7}  " + "  ".join(f"{'-'*5}" for _ in TENANT_EXTS))
     ext_totals_row = "  ".join(f"{totals_ext[e]:>5}" for e in TENANT_EXTS)
     print(f"  {'TOTAL':<22} {total_items:>7}  {ext_totals_row}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# -- Main ----------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Graph API drive inspector")
-    parser.add_argument("--site", help="SharePoint site, e.g. airtho.sharepoint.com/sites/Airtho")
+    parser.add_argument("--site", help="SharePoint site, e.g. contoso.sharepoint.com/sites/Team")
     parser.add_argument("--drive-id", help="Drive ID (skips site/drive selection)")
     parser.add_argument("--days", type=int, default=30, help="Days back for recent-modified query")
     parser.add_argument("--sample", type=int, default=10, help="Number of root items to show")

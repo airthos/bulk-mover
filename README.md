@@ -1,91 +1,86 @@
-# OneDrive → SharePoint Migration Tool
+# Bulk Mover
 
-Copies files from a personal OneDrive to a SharePoint document library using the Microsoft Graph API. All copying happens server-side — no file bytes pass through the local machine.
+Copies files from a OneDrive source URL into a SharePoint document library using Microsoft Graph. The tool runs server-side copy jobs, so file bytes do not pass through your machine.
 
-Built for the Airtho M365 tenant. Assumes the destination library is empty.
+The current behavior is intentionally small:
 
----
+- Select a OneDrive root folder or shortcut, or paste a OneDrive URL.
+- Select a followed SharePoint site, or paste a SharePoint site URL.
+- Select a destination document library and folder.
+- Scan source and destination with Graph delta and visible progress.
+- Write a visible plan for every source and destination-only file.
+- Show compact terminal progress for folder creation, trash moves, copy submission, and monitoring.
+- Run folder creation, copy jobs, and trash moves with a controlled local concurrency window.
+- Copy missing files.
+- Replace destination files when the source is newer or the size differs.
+- Move destination-only files to a root `TRASH` folder in the destination, renamed with their item ID to avoid conflicts.
+- Write plain logs and a final CSV report.
+- Never modify source files or folders.
 
 ## Setup
 
-**1. Install dependencies**
 ```bash
 pip install -r requirements.txt
 ```
 
-**2. Create a `.env` file at the project root**
-```
+Create `.env`:
+
+```text
 AZURE_CLIENT_ID=your-app-client-id
 AZURE_TENANT_ID=your-tenant-id
 ```
 
-**3. Register an Azure app** (one-time)
+The Azure app needs delegated Microsoft Graph permissions:
 
-- Azure Portal → App registrations → New registration
-- Single tenant, any name (e.g. `airtho-migration`)
-- Authentication → Add platform → Mobile and desktop → add redirect URI:
-  `https://login.microsoftonline.com/common/oauth2/nativeclient`
-- Enable **Allow public client flows**
-- API permissions → Add → Microsoft Graph → Delegated:
-  - `Files.ReadWrite.All`
-  - `Sites.ReadWrite.All`
-  - `User.Read`
-- Grant admin consent
-- Copy **Application (client) ID** and **Directory (tenant) ID** into `.env`
+- `Files.ReadWrite.All`
+- `Sites.ReadWrite.All`
+- `User.Read`
 
----
-
-## Usage
+## Run
 
 ```bash
-python migrate.py                          # interactive run (sequential)
-python migrate.py --parallel 4             # 4 concurrent folder copies
-python migrate.py --verify-only manifest.json  # re-verify from a session manifest
+python migrate.py
 ```
 
-The tool walks you through:
+There are no CLI flags. The script prompts for everything it needs.
 
-1. **Sign in** — device code flow; opens a browser tab once, then caches the token
-2. **Resume?** — if an incomplete session exists, offers to resume it (skips all prompts)
-3. **Pick source** — enter the OneDrive user's UPN, then select a folder
-4. **Pick destination** — enter the SharePoint site URL, select a document library and optional subfolder
-5. **Review batches** — the tool scans one level deep; each subfolder = one batch
-6. **Run** — copies each batch, verifies integrity, writes a CSV report per batch
+## Resume
 
----
+Each run writes:
 
-## Output
+```text
+migration-logs/<timestamp>_<source>/
+  run.json
+  plan.csv
+  ledger.jsonl
+  report.csv
+```
 
-Results are written to `./migration-logs/`:
-
-| File | Description |
-|------|-------------|
-| `{date}_{folder}_batch-{nn}_{name}.csv` | Per-file result for each batch |
-| `{date}_{folder}_session.manifest.json` | Full session record with source metadata and verify status |
-
-### Verification statuses
-
-| Status | Meaning |
-|--------|---------|
-| `OK` | Size and hash match |
-| `OK_SP_OVERHEAD` | Office doc — dest slightly larger due to co-authoring XML (expected) |
-| `OK_IMAGE_META` | Image — hash differs due to metadata rewrite (expected) |
-| `SIZE_MISMATCH` | File sizes differ |
-| `HASH_MISMATCH` | Sizes match but `quickXorHash` differs |
-| `HASH_PENDING` | Hash not yet computed by Microsoft after copy; needs follow-up |
-| `MISSING` | File not found at destination after copy |
-| `COPY_FAILED` | Copy job failed or timed out |
-
----
+`plan.csv` lists every planned action. `ledger.jsonl` is append-only. Each file gets rows such as `SUBMITTED`, `COMPLETED`, `SKIPPED`, or `FAILED`. If a run stops or fails, the next launch offers to resume it and monitors any submitted copy jobs before rebuilding the plan.
 
 ## Architecture
 
 | File | Responsibility |
-|------|---------------|
-| `migrate.py` | Entry point; orchestrates the full flow |
-| `auth.py` | MSAL device code flow + token cache |
-| `graph.py` | All Graph API calls; throttle/retry wrapper; JSON batching |
-| `prompts.py` | Terminal selection menus (`inquirer`) |
-| `batch.py` | Batch scanning and per-batch copy orchestration |
-| `verify.py` | Post-copy file comparison (size + `quickXorHash`) |
-| `report.py` | CSV and manifest JSON writer |
+|------|----------------|
+| `migrate.py` | Single interactive entrypoint |
+| `auth.py` | MSAL device code auth and token cache |
+| `graph.py` | Microsoft Graph requests, URL resolution, copy jobs |
+| `prompts.py` | Terminal prompts |
+| `sync.py` | Delta scan, plan, folder create, copy submit, monitor, trash, report |
+| `report.py` | Shared log directory helpers |
+
+Copy, folder, and trash concurrency is controlled by `MAX_ACTIVE_JOBS` in `sync.py`. Copy monitor polling is controlled by `COPY_POLL_INTERVAL`.
+
+## Copy Rules
+
+For each source file:
+
+| Condition | Action |
+|-----------|--------|
+| Destination file missing | Copy |
+| Destination file size differs | Replace |
+| Source modified time is newer | Replace |
+| Destination appears current | Skip |
+| Destination file missing from source | Move to `TRASH` with conflict-safe rename |
+
+Folders are created as needed. Existing destination folders are reused.
